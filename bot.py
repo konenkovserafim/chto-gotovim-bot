@@ -40,6 +40,16 @@ CATEGORY_TITLES = {
 }
 TEXT_TO_CATEGORY = {v: k for k, v in CATEGORY_TITLES.items()}
 
+WEEK_DAYS = [
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+    "Воскресенье",
+]
+
 FRIDGE_CATEGORIES = {
     "meat": {"title": "🥩 Мясо", "products": [
         {"code": "chicken", "title": "🐔 Курица", "aliases": ["куриц", "филе", "голень", "бедро"]},
@@ -856,6 +866,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:notifications")],
             [InlineKeyboardButton(text="📖 История приготовлений", callback_data="settings:history")],
+            [InlineKeyboardButton(text="📅 Меню недели", callback_data="settings:weekly")],
             [InlineKeyboardButton(text="🔍 Фильтры поиска", callback_data="filters:menu")],
             [InlineKeyboardButton(text="👥 Профили", callback_data="settings:profiles")],
             [InlineKeyboardButton(text="ℹ️ О боте", callback_data="settings:about")],
@@ -1031,6 +1042,140 @@ def format_profile_summary(user_id: int) -> str:
             lines.append(f"• Заметка: {p['notes']}")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+
+def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int]) -> int:
+    """Простая оценка для меню недели: холодильник, избранное, оценки, история и разнообразие."""
+    recipe_id = int(recipe.get("id", 0) or 0)
+    score = 0
+
+    if recipe_id in used_ids:
+        score -= 100
+
+    selected = set(get_fridge_items(user_id))
+    required = detected_product_codes(recipe)
+    if required:
+        matched = required & selected
+        missing = required - selected
+        if not missing:
+            score += 8
+        elif len(missing) <= 2:
+            score += 4
+        score += min(len(matched), 3)
+
+    if recipe_id in set(get_favorites(user_id)):
+        score += 3
+
+    rating = get_user_recipe_rating(user_id, recipe_id)
+    if rating:
+        score += rating
+
+    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=10):
+        score -= 5
+
+    time = int(recipe.get("time", 0) or 0)
+    if time and time <= 30:
+        score += 1
+
+    return score
+
+
+def pick_week_recipe(category: str, user_id: int, used_ids: set[int]) -> dict[str, Any] | None:
+    candidates = recipes_for_category(category)
+    if not candidates:
+        return None
+    scored = [(score_recipe_for_week(r, user_id, used_ids), random.random(), r) for r in candidates]
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    recipe = scored[0][2]
+    used_ids.add(int(recipe["id"]))
+    return recipe
+
+
+def generate_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
+    used_ids: set[int] = set()
+    menu: dict[str, list[dict[str, Any]]] = {}
+    for day in WEEK_DAYS:
+        day_items: list[dict[str, Any]] = []
+        for category in ["breakfast", "lunch", "dinner"]:
+            recipe = pick_week_recipe(category, user_id, used_ids)
+            if recipe:
+                day_items.append(recipe)
+        menu[day] = day_items
+    set_user_flag(
+        user_id,
+        "weekly_menu_ids",
+        json.dumps({day: [int(r["id"]) for r in items] for day, items in menu.items()}, ensure_ascii=False),
+    )
+    return menu
+
+
+def get_saved_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
+    raw = get_user_flag(user_id, "weekly_menu_ids")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    menu: dict[str, list[dict[str, Any]]] = {}
+    for day, ids in data.items():
+        items = []
+        for recipe_id in ids:
+            recipe = RECIPES_BY_ID.get(int(recipe_id))
+            if recipe:
+                items.append(recipe)
+        if items:
+            menu[day] = items
+    return menu
+
+
+def format_weekly_menu(menu: dict[str, list[dict[str, Any]]]) -> str:
+    if not menu:
+        return (
+            "📅 <b>Меню недели</b>\n\n"
+            "Пока меню не составлено. Нажми кнопку ниже, и я подберу блюда на неделю."
+        )
+    lines = ["📅 <b>Меню недели</b>", ""]
+    for day in WEEK_DAYS:
+        items = menu.get(day, [])
+        if not items:
+            continue
+        lines.append(f"<b>{day}</b>")
+        for recipe in items:
+            icon = CATEGORY_TITLES.get(recipe.get("category"), "🍽").split()[0]
+            lines.append(f"{icon} {recipe['name']}")
+        lines.append("")
+    lines.append("🛒 Можно одной кнопкой добавить продукты в список покупок.")
+    return "\n".join(lines).strip()
+
+
+def weekly_menu_keyboard(has_menu: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if has_menu:
+        rows.append([InlineKeyboardButton(text="🛒 Добавить продукты в покупки", callback_data="week:shopping")])
+        rows.append([InlineKeyboardButton(text="🔄 Составить заново", callback_data="week:generate")])
+    else:
+        rows.append([InlineKeyboardButton(text="📅 Составить меню на неделю", callback_data="week:generate")])
+    rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def add_weekly_menu_to_shopping(user_id: int) -> int:
+    menu = get_saved_weekly_menu(user_id)
+    added = 0
+    seen: set[str] = set()
+    for items in menu.values():
+        for recipe in items:
+            for ingredient in recipe.get("ingredients", []):
+                ingredient = str(ingredient).strip()
+                if not ingredient or ingredient in seen:
+                    continue
+                seen.add(ingredient)
+                if add_shopping_item_db(user_id, ingredient):
+                    added += 1
+    return added
 
 
 def format_portions(recipe: dict[str, Any], user_id: int) -> str:
@@ -1324,6 +1469,34 @@ async def settings_history_callback(callback: CallbackQuery):
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data == "settings:weekly")
+async def settings_weekly_callback(callback: CallbackQuery):
+    menu = get_saved_weekly_menu(callback.from_user.id)
+    await callback.message.edit_text(
+        format_weekly_menu(menu),
+        reply_markup=weekly_menu_keyboard(bool(menu)),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "week:generate")
+async def week_generate_callback(callback: CallbackQuery):
+    menu = generate_weekly_menu(callback.from_user.id)
+    await callback.message.edit_text(
+        format_weekly_menu(menu),
+        reply_markup=weekly_menu_keyboard(True),
+        parse_mode="HTML",
+    )
+    await callback.answer("Меню составлено")
+
+
+@dp.callback_query(F.data == "week:shopping")
+async def week_shopping_callback(callback: CallbackQuery):
+    added = add_weekly_menu_to_shopping(callback.from_user.id)
+    await callback.answer(f"Добавлено продуктов: {added} 🛒")
 
 
 @dp.callback_query(F.data == "history:clear")
