@@ -3,7 +3,6 @@
 Telegram-бот с меню и рецептами для Серафима и Тани.
 
 ## Railway
+Нужна переменная окружения:
 
-Environment variable:
-
-BOT_TOKEN=your_telegram_bot_token
+BOT_TOKEN=токен_бота
