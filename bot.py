@@ -73,6 +73,39 @@ def update_user_record(user_id: int, record: Dict[str, Any]) -> None:
     save_json_file(USER_DATA_FILE, data)
 
 
+def normalize_item(item: str) -> str:
+    return " ".join(item.strip().split())
+
+
+def add_shopping_item(record: Dict[str, Any], item: str) -> bool:
+    item = normalize_item(item)
+    if not item:
+        return False
+    shopping = record.setdefault("shopping", [])
+    existing = {normalize_item(x).casefold() for x in shopping}
+    if item.casefold() not in existing:
+        shopping.append(item)
+        return True
+    return False
+
+
+def shopping_keyboard(items: List[str]) -> InlineKeyboardMarkup:
+    rows = []
+    if items:
+        rows.append([InlineKeyboardButton(text="➖ Удалить продукт", callback_data="shopping_delete_menu")])
+        rows.append([InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear_shopping")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить вручную", callback_data="shopping_add_manual")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def shopping_delete_keyboard(items: List[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for index, item in enumerate(items[:40]):
+        rows.append([InlineKeyboardButton(text=f"❌ {item}", callback_data=f"shopping_delete:{index}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="shopping_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def recipes_by_category(category: str) -> List[Dict[str, Any]]:
     return [r for r in RECIPES if r.get("category") == category]
 
@@ -236,20 +269,87 @@ async def add_shopping(callback: CallbackQuery):
         await callback.answer("Рецепт не найден")
         return
     record = get_user_record(callback.from_user.id)
-    shopping = record.setdefault("shopping", [])
+    added_count = 0
     for item in recipe["ingredients"]:
-        if item not in shopping:
-            shopping.append(item)
+        if add_shopping_item(record, item):
+            added_count += 1
     update_user_record(callback.from_user.id, record)
-    await callback.answer("Добавлено в список продуктов 🛒")
+    await callback.answer(f"Добавлено продуктов: {added_count} 🛒")
+
+
+@dp.callback_query(F.data == "shopping_add_manual")
+async def shopping_add_manual(callback: CallbackQuery):
+    record = get_user_record(callback.from_user.id)
+    record["awaiting_shopping_item"] = True
+    update_user_record(callback.from_user.id, record)
+    await callback.message.answer("➕ Напиши продукт, который добавить в список. Например: <b>молоко 1 л</b>", parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "shopping_delete_menu")
+async def shopping_delete_menu(callback: CallbackQuery):
+    record = get_user_record(callback.from_user.id)
+    items = record.get("shopping", [])
+    if not items:
+        await callback.message.answer("🛒 Список уже пуст.")
+        await callback.answer()
+        return
+    await callback.message.answer(
+        "Нажми на продукт, который нужно удалить:",
+        reply_markup=shopping_delete_keyboard(items),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("shopping_delete:"))
+async def shopping_delete_item(callback: CallbackQuery):
+    index_text = callback.data.split(":", 1)[1]
+    record = get_user_record(callback.from_user.id)
+    items = record.get("shopping", [])
+    try:
+        index = int(index_text)
+        removed = items.pop(index)
+    except Exception:
+        await callback.answer("Не получилось удалить")
+        return
+    record["shopping"] = items
+    update_user_record(callback.from_user.id, record)
+    await callback.message.answer(f"❌ Удалил: <b>{removed}</b>", parse_mode="HTML")
+    if items:
+        text = "🛒 <b>Список продуктов</b>
+
+" + "
+".join(f"• {item}" for item in items)
+        await callback.message.answer(text, reply_markup=shopping_keyboard(items), parse_mode="HTML")
+    else:
+        await callback.message.answer("🛒 Список продуктов теперь пуст.", reply_markup=shopping_keyboard(items))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "shopping_back")
+async def shopping_back(callback: CallbackQuery):
+    record = get_user_record(callback.from_user.id)
+    items = record.get("shopping", [])
+    if items:
+        text = "🛒 <b>Список продуктов</b>
+
+" + "
+".join(f"• {item}" for item in items)
+    else:
+        text = "🛒 <b>Список продуктов</b>
+
+Пока пусто."
+    await callback.message.answer(text, reply_markup=shopping_keyboard(items), parse_mode="HTML")
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "clear_shopping")
 async def clear_shopping(callback: CallbackQuery):
     record = get_user_record(callback.from_user.id)
     record["shopping"] = []
+    record["awaiting_shopping_item"] = False
     update_user_record(callback.from_user.id, record)
-    await callback.message.answer("🛒 Список продуктов очищен.")
+    await callback.message.answer("🛒 Список продуктов очищен.", reply_markup=shopping_keyboard([]))
     await callback.answer()
 
 
