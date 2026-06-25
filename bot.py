@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -294,7 +295,7 @@ async def fallback(message: Message):
 
 
 async def main():
-    bot = Bot(BOT_TOKEN, parse_mode="HTML")
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     logger.info("Bot started. Recipes loaded: %s", len(RECIPES))
     await dp.start_polling(bot)
 
