@@ -168,6 +168,18 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, product_code)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS household_profiles (
+                user_id INTEGER NOT NULL,
+                profile_code TEXT NOT NULL,
+                name TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                calories INTEGER NOT NULL,
+                portion_factor REAL NOT NULL,
+                notes TEXT,
+                PRIMARY KEY (user_id, profile_code)
+            )
+        """)
         for recipe in recipes:
             conn.execute(
                 """
@@ -279,6 +291,50 @@ def clear_fridge_db(user_id: int) -> None:
         conn.commit()
 
 
+DEFAULT_PROFILES = [
+    {
+        "code": "serafim",
+        "name": "Серафим",
+        "goal": "сытная порция / поддержание",
+        "calories": 2600,
+        "factor": 0.60,
+        "notes": "порция побольше",
+    },
+    {
+        "code": "tanya",
+        "name": "Таня",
+        "goal": "полегче / похудение",
+        "calories": 1700,
+        "factor": 0.40,
+        "notes": "порция поменьше, без свинины в будущих подборках",
+    },
+]
+
+
+def ensure_profiles(user_id: int) -> None:
+    with db_connect() as conn:
+        for p in DEFAULT_PROFILES:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO household_profiles
+                (user_id, profile_code, name, goal, calories, portion_factor, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, p["code"], p["name"], p["goal"], p["calories"], p["factor"], p["notes"]),
+            )
+        conn.commit()
+
+
+def get_profiles(user_id: int) -> list[dict[str, Any]]:
+    ensure_profiles(user_id)
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM household_profiles WHERE user_id = ? ORDER BY CASE profile_code WHEN 'serafim' THEN 1 WHEN 'tanya' THEN 2 ELSE 3 END",
+            (user_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 init_db()
 RECIPES = get_all_recipes()
 RECIPES_BY_ID = {int(r["id"]): r for r in RECIPES}
@@ -290,8 +346,8 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
             [KeyboardButton(text="🎲 Что приготовить?"), KeyboardButton(text="🔍 Поиск")],
             [KeyboardButton(text="⚙️ Фильтры"), KeyboardButton(text="❤️ Избранное")],
-            [KeyboardButton(text="🛒 Список продуктов")],
-            [KeyboardButton(text="🥶 Холодильник")],
+            [KeyboardButton(text="🛒 Список продуктов"), KeyboardButton(text="🥶 Холодильник")],
+            [KeyboardButton(text="👥 Профили")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери раздел",
@@ -328,7 +384,8 @@ def recipe_actions_keyboard(recipe_id: int, category: str | None = None, page: i
         [
             InlineKeyboardButton(text="❤️ В избранное", callback_data=f"fav:{recipe_id}"),
             InlineKeyboardButton(text="🛒 В список", callback_data=f"shop:{recipe_id}"),
-        ]
+        ],
+        [InlineKeyboardButton(text="👥 Порции для нас", callback_data=f"portions:{recipe_id}")],
     ]
     if category:
         rows.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"cat:{category}:{page}")])
@@ -632,6 +689,63 @@ def format_search_results(query: str, page: int = 0) -> str:
     )
 
 
+
+def scale_ingredient_text(item: str, factor: float) -> str:
+    """Простое масштабирование ингредиента вида 'продукт — 100 г'."""
+    if "—" not in item:
+        return item
+    name, amount = [part.strip() for part in item.split("—", 1)]
+    import re
+    match = re.search(r"(\d+(?:[,.]\d+)?)", amount)
+    if not match:
+        return item
+    raw_number = match.group(1)
+    try:
+        number = float(raw_number.replace(",", "."))
+    except ValueError:
+        return item
+    scaled = number * factor
+    if scaled >= 10:
+        scaled_text = str(int(round(scaled)))
+    else:
+        scaled_text = (f"{scaled:.1f}".rstrip("0").rstrip("."))
+    new_amount = amount[:match.start()] + scaled_text + amount[match.end():]
+    return f"{name} — {new_amount}"
+
+
+def format_profile_summary(user_id: int) -> str:
+    profiles = get_profiles(user_id)
+    lines = ["👥 <b>Профили</b>", "", "Пока стоят базовые настройки. Потом добавим редактирование прямо в боте.", ""]
+    for p in profiles:
+        icon = "👨" if p["profile_code"] == "serafim" else "👩"
+        percent = int(round(float(p["portion_factor"]) * 100))
+        lines.append(f"{icon} <b>{p['name']}</b>")
+        lines.append(f"• Цель: {p['goal']}")
+        lines.append(f"• Дневная норма: ~{p['calories']} ккал")
+        lines.append(f"• Доля порции: ~{percent}%")
+        if p.get("notes"):
+            lines.append(f"• Заметка: {p['notes']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def format_portions(recipe: dict[str, Any], user_id: int) -> str:
+    profiles = get_profiles(user_id)
+    total_cal = int(recipe.get("calories", 0) or 0)
+    lines = [f"👥 <b>Порции: {recipe['name']}</b>", "", "Расчёт примерный: рецепт делится между вами по долям.", ""]
+    for p in profiles:
+        icon = "👨" if p["profile_code"] == "serafim" else "👩"
+        factor = float(p["portion_factor"])
+        kcal = int(round(total_cal * factor)) if total_cal else 0
+        lines.append(f"{icon} <b>{p['name']}</b> — примерно {int(round(factor * 100))}%")
+        if kcal:
+            lines.append(f"🔥 ~{kcal} ккал")
+        for item in recipe.get("ingredients", [])[:12]:
+            lines.append(f"• {scale_ingredient_text(item, factor)}")
+        lines.append("")
+    lines.append("🛒 В список покупок всё равно добавляются общие ингредиенты на двоих.")
+    return "\n".join(lines)
+
 def format_recipe(r: dict[str, Any]) -> str:
     ingredients = "\n".join(f"• {item}" for item in r.get("ingredients", []))
     steps = "\n".join(f"{i}. {step}" for i, step in enumerate(r.get("steps", []), 1))
@@ -743,6 +857,22 @@ async def filter_recipe_callback(callback: CallbackQuery):
     )
     await callback.answer()
 
+
+
+@dp.message(F.text == "👥 Профили")
+async def profiles_message(message: Message):
+    await message.answer(format_profile_summary(message.from_user.id), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("portions:"))
+async def portions_callback(callback: CallbackQuery):
+    recipe_id = int(callback.data.split(":")[1])
+    recipe = RECIPES_BY_ID.get(recipe_id)
+    if not recipe:
+        await callback.answer("Рецепт не найден", show_alert=True)
+        return
+    await callback.message.answer(format_portions(recipe, callback.from_user.id), parse_mode="HTML")
+    await callback.answer()
 
 @dp.message(F.text == "❤️ Избранное")
 async def favorites_message(message: Message):
