@@ -3,7 +3,7 @@ import os
 import random
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
@@ -104,6 +104,19 @@ RECIPES = {
 favorites = set()
 shopping = []
 
+def reply_main_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text='🔍 Завтрак'), KeyboardButton(text='🍲 Обед')],
+            [KeyboardButton(text='🍽 Ужин'), KeyboardButton(text='🥗 Перекус')],
+            [KeyboardButton(text='🎲 Что приготовить?')],
+            [KeyboardButton(text='❤️ Избранное'), KeyboardButton(text='🛒 Список продуктов')],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder='Выбери раздел'
+    )
+
+
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='🔍 Завтрак', callback_data='cat:breakfast'), InlineKeyboardButton(text='🍲 Обед', callback_data='cat:lunch')],
@@ -151,13 +164,51 @@ def recipe_text(r):
 async def show_home(target):
     text = '🍽 Привет! Я бот «Что готовим?»\n\nПомогу выбрать завтрак, обед, ужин или перекус для вас с Таней.'
     if isinstance(target, Message):
-        await target.answer(text, reply_markup=main_kb())
+        await target.answer(text, reply_markup=reply_main_kb())
     else:
-        await target.message.edit_text(text, reply_markup=main_kb())
+        await target.message.answer(text, reply_markup=reply_main_kb())
 
 @dp.message(CommandStart())
 async def start(message: Message):
     await show_home(message)
+
+
+
+CATEGORY_BY_TEXT = {
+    '🔍 Завтрак': 'breakfast',
+    '🍳 Завтрак': 'breakfast',
+    '🍲 Обед': 'lunch',
+    '🍽 Ужин': 'dinner',
+    '🥗 Перекус': 'snack',
+}
+
+@dp.message(F.text.in_(list(CATEGORY_BY_TEXT.keys())))
+async def category_from_keyboard(message: Message):
+    cat = CATEGORY_BY_TEXT[message.text]
+    await message.answer(f"{RECIPES[cat]['title']}\n\nВыбери блюдо:", reply_markup=category_kb(cat))
+
+@dp.message(F.text == '🎲 Что приготовить?')
+async def random_from_keyboard(message: Message):
+    cat = random.choice(list(RECIPES.keys()))
+    r = random.choice(RECIPES[cat]['items'])
+    await message.answer('🎲 Случайный вариант\n\n' + recipe_text(r), reply_markup=recipe_kb(cat, r['id']))
+
+@dp.message(F.text == '❤️ Избранное')
+async def favorites_from_keyboard(message: Message):
+    if not favorites:
+        await message.answer('❤️ Избранное пока пустое.')
+        return
+    lines = ['❤️ Избранное:']
+    for cat, rid in favorites:
+        lines.append('• ' + find_recipe(cat, rid)['name'])
+    await message.answer('\n'.join(lines))
+
+@dp.message(F.text == '🛒 Список продуктов')
+async def shopping_from_keyboard(message: Message):
+    if not shopping:
+        await message.answer('🛒 Список продуктов пока пустой.')
+        return
+    await message.answer('🛒 Список продуктов:\n' + '\n'.join(f'• {x}' for x in shopping))
 
 @dp.callback_query(F.data == 'home')
 async def home(call: CallbackQuery):
