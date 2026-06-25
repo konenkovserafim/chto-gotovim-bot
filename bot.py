@@ -1180,8 +1180,12 @@ def format_recommendation(recipe: dict[str, Any], reasons: list[str]) -> str:
     lines = [
         f"🍽 <b>Сегодня предлагаю «{recipe['name']}»</b>",
         "",
+        "<b>Почему именно это блюдо?</b>",
     ]
-    lines.extend(reasons)
+    if reasons:
+        lines.extend(reasons)
+    else:
+        lines.append("🍽 Подходит под текущее время дня.")
     return "\n".join(lines)
 
 
