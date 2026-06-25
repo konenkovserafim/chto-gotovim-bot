@@ -1194,7 +1194,7 @@ async def fallback(message: Message):
             parse_mode="HTML",
         )
         return
-    await message.answer("Выбери раздел на клавиатуре 👇", reply_markup=main_keyboard())
+    return
 
 
 async def main():
