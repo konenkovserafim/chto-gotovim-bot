@@ -190,6 +190,23 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, key)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cooking_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                recipe_id INTEGER NOT NULL,
+                cooked_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS recipe_ratings (
+                user_id INTEGER NOT NULL,
+                recipe_id INTEGER NOT NULL,
+                rating INTEGER NOT NULL,
+                rated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, recipe_id)
+            )
+        """)
         for recipe in recipes:
             conn.execute(
                 """
@@ -319,6 +336,87 @@ def set_user_flag(user_id: int, key: str, value: str) -> None:
         conn.commit()
 
 
+def add_cooked_recipe(user_id: int, recipe_id: int) -> int:
+    cooked_at = datetime.now(ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Moscow"))).isoformat(timespec="seconds")
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO cooking_history (user_id, recipe_id, cooked_at) VALUES (?, ?, ?)",
+            (user_id, recipe_id, cooked_at),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM cooking_history WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return int(row["count"] or 0)
+
+
+def get_cooked_count(user_id: int) -> int:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM cooking_history WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return int(row["count"] or 0) if row else 0
+
+
+def get_top_cooked_recipe(user_id: int) -> dict[str, Any] | None:
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT recipe_id, COUNT(*) AS count
+            FROM cooking_history
+            WHERE user_id = ?
+            GROUP BY recipe_id
+            ORDER BY count DESC, MAX(cooked_at) DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return RECIPES_BY_ID.get(int(row["recipe_id"]))
+
+
+def set_recipe_rating(user_id: int, recipe_id: int, rating: int) -> None:
+    rated_at = datetime.now(ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Moscow"))).isoformat(timespec="seconds")
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO recipe_ratings (user_id, recipe_id, rating, rated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, recipe_id, rating, rated_at),
+        )
+        conn.commit()
+
+
+def get_user_recipe_rating(user_id: int, recipe_id: int) -> int | None:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT rating FROM recipe_ratings WHERE user_id = ? AND recipe_id = ?",
+            (user_id, recipe_id),
+        ).fetchone()
+    return int(row["rating"]) if row else None
+
+
+def get_top_rated_recipe(user_id: int) -> dict[str, Any] | None:
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT recipe_id, rating
+            FROM recipe_ratings
+            WHERE user_id = ?
+            ORDER BY rating DESC, rated_at DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return RECIPES_BY_ID.get(int(row["recipe_id"]))
+
+
 DEFAULT_PROFILES = [
     {
         "code": "serafim",
@@ -410,6 +508,10 @@ def recipe_list_keyboard(category: str, page: int = 0) -> InlineKeyboardMarkup:
 def recipe_actions_keyboard(recipe_id: int, category: str | None = None, page: int = 0) -> InlineKeyboardMarkup:
     rows = [
         [
+            InlineKeyboardButton(text="✅ Приготовили", callback_data=f"cooked:{recipe_id}"),
+            InlineKeyboardButton(text="⭐ Оценить", callback_data=f"rate:{recipe_id}"),
+        ],
+        [
             InlineKeyboardButton(text="❤️ В избранное", callback_data=f"fav:{recipe_id}"),
             InlineKeyboardButton(text="🛒 В список", callback_data=f"shop:{recipe_id}"),
         ],
@@ -418,6 +520,23 @@ def recipe_actions_keyboard(recipe_id: int, category: str | None = None, page: i
     if category:
         rows.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"cat:{category}:{page}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def rating_keyboard(recipe_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⭐", callback_data=f"rateval:{recipe_id}:1"),
+                InlineKeyboardButton(text="⭐⭐", callback_data=f"rateval:{recipe_id}:2"),
+                InlineKeyboardButton(text="⭐⭐⭐", callback_data=f"rateval:{recipe_id}:3"),
+            ],
+            [
+                InlineKeyboardButton(text="⭐⭐⭐⭐", callback_data=f"rateval:{recipe_id}:4"),
+                InlineKeyboardButton(text="⭐⭐⭐⭐⭐", callback_data=f"rateval:{recipe_id}:5"),
+            ],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
+    )
 
 
 def favorites_keyboard(fav_ids: list[int]) -> InlineKeyboardMarkup:
@@ -641,6 +760,9 @@ def settings_text() -> str:
 
 
 def about_text(user_id: int) -> str:
+    cooked_count = get_cooked_count(user_id)
+    favorite_recipe = get_top_cooked_recipe(user_id) or get_top_rated_recipe(user_id)
+    favorite_name = favorite_recipe["name"] if favorite_recipe else "пока не выбрано"
     return (
         "🍽 <b>Что готовим?</b>\n\n"
         "Версия <b>1.5</b>\n\n"
@@ -648,10 +770,9 @@ def about_text(user_id: int) -> str:
         "Разработано с ❤️\n"
         "для Серафима и Тани.\n\n"
         f"📖 Рецептов: <b>{len(RECIPES)}</b>\n"
-        "🍳 Приготовлено: <b>42 блюда</b>\n"
-        "❤️ Любимое: <b>Сырники</b>"
+        f"🍳 Приготовлено: <b>{cooked_count}</b>\n"
+        f"❤️ Любимое: <b>{favorite_name}</b>"
     )
-
 
 def about_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -1318,6 +1439,59 @@ async def random_category_callback(callback: CallbackQuery):
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("cooked:"))
+async def mark_cooked(callback: CallbackQuery):
+    recipe_id = int(callback.data.split(":")[1])
+    recipe = RECIPES_BY_ID.get(recipe_id)
+    if not recipe:
+        await callback.answer("Рецепт не найден", show_alert=True)
+        return
+    total = add_cooked_recipe(callback.from_user.id, recipe_id)
+    await callback.answer("Отметил как приготовленное ✅")
+    await callback.message.answer(
+        f"✅ <b>Приготовили: {recipe['name']}</b>\n\n"
+        f"🍳 Всего приготовлено блюд: <b>{total}</b>\n\n"
+        "Можно сразу оценить блюдо:",
+        reply_markup=rating_keyboard(recipe_id),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("rate:"))
+async def rate_recipe(callback: CallbackQuery):
+    recipe_id = int(callback.data.split(":")[1])
+    recipe = RECIPES_BY_ID.get(recipe_id)
+    if not recipe:
+        await callback.answer("Рецепт не найден", show_alert=True)
+        return
+    current = get_user_recipe_rating(callback.from_user.id, recipe_id)
+    suffix = f"\n\nТекущая оценка: <b>{current}⭐</b>" if current else ""
+    await callback.message.answer(
+        f"⭐ <b>Оценить блюдо</b>\n\n{recipe['name']}{suffix}\n\nВыбери оценку:",
+        reply_markup=rating_keyboard(recipe_id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("rateval:"))
+async def save_recipe_rating(callback: CallbackQuery):
+    _, recipe_id_s, rating_s = callback.data.split(":")
+    recipe_id = int(recipe_id_s)
+    rating = int(rating_s)
+    recipe = RECIPES_BY_ID.get(recipe_id)
+    if not recipe:
+        await callback.answer("Рецепт не найден", show_alert=True)
+        return
+    set_recipe_rating(callback.from_user.id, recipe_id, rating)
+    await callback.answer(f"Оценка сохранена: {rating}⭐")
+    await callback.message.edit_text(
+        f"⭐ <b>Оценка сохранена</b>\n\n{recipe['name']} — <b>{rating}⭐</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")]]),
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data.startswith("fav:"))
