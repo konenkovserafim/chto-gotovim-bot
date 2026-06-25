@@ -11,6 +11,7 @@ from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardB
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATA_FILE = Path("recipes.json")
+USER_DATA_FILE = Path("user_data.json")
 
 CATEGORY_TITLES = {
     "breakfast": "🍳 Завтрак",
@@ -31,15 +32,45 @@ main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-user_favorites: Dict[int, set] = {}
-user_shopping: Dict[int, List[str]] = {}
+
+def load_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json_file(path: Path, data: Any) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def load_recipes() -> List[Dict[str, Any]]:
-    with DATA_FILE.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    return load_json_file(DATA_FILE, [])
+
 
 RECIPES = load_recipes()
 RECIPES_BY_ID = {r["id"]: r for r in RECIPES}
+
+
+def get_user_record(user_id: int) -> Dict[str, Any]:
+    data = load_json_file(USER_DATA_FILE, {})
+    key = str(user_id)
+    if key not in data:
+        data[key] = {"favorites": [], "shopping": []}
+        save_json_file(USER_DATA_FILE, data)
+    data[key].setdefault("favorites", [])
+    data[key].setdefault("shopping", [])
+    return data[key]
+
+
+def update_user_record(user_id: int, record: Dict[str, Any]) -> None:
+    data = load_json_file(USER_DATA_FILE, {})
+    data[str(user_id)] = record
+    save_json_file(USER_DATA_FILE, data)
 
 
 def recipes_by_category(category: str) -> List[Dict[str, Any]]:
@@ -122,30 +153,38 @@ async def random_any(message: Message):
 
 @dp.message(F.text == "❤️ Избранное")
 async def favorites(message: Message):
-    favs = user_favorites.get(message.from_user.id, set())
+    record = get_user_record(message.from_user.id)
+    favs = record.get("favorites", [])
     if not favs:
         await message.answer("❤️ В избранном пока пусто. Открой блюдо и нажми «В избранное».")
         return
-    lines = ["❤️ <b>Избранное</b>\n"]
+
+    rows = []
+    lines = ["❤️ <b>Избранное</b>", "", "Нажми на блюдо, чтобы открыть карточку:", ""]
     for recipe_id in favs:
         recipe = RECIPES_BY_ID.get(recipe_id)
         if recipe:
             lines.append(f"• {recipe['emoji']} {recipe['title']}")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+            rows.append([InlineKeyboardButton(text=f"{recipe['emoji']} {recipe['title']}", callback_data=f"recipe:{recipe_id}")])
+    rows.append([InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear_favorites")])
+    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
 
 
 @dp.message(F.text == "🛒 Список продуктов")
 async def shopping_list(message: Message):
-    items = user_shopping.get(message.from_user.id, [])
+    record = get_user_record(message.from_user.id)
+    items = record.get("shopping", [])
     if not items:
         await message.answer("🛒 Список продуктов пока пуст. Открой блюдо и нажми «В список продуктов».")
         return
+
     unique_items = []
     for item in items:
         if item not in unique_items:
             unique_items.append(item)
     text = "🛒 <b>Список продуктов</b>\n\n" + "\n".join(f"• {item}" for item in unique_items)
-    await message.answer(text, parse_mode="HTML")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear_shopping")]])
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("recipe:"))
@@ -170,8 +209,23 @@ async def random_category(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("fav:"))
 async def add_favorite(callback: CallbackQuery):
     recipe_id = callback.data.split(":", 1)[1]
-    user_favorites.setdefault(callback.from_user.id, set()).add(recipe_id)
+    record = get_user_record(callback.from_user.id)
+    favorites_list = record.setdefault("favorites", [])
+    if recipe_id in favorites_list:
+        await callback.answer("Уже есть в избранном ❤️")
+        return
+    favorites_list.append(recipe_id)
+    update_user_record(callback.from_user.id, record)
     await callback.answer("Добавлено в избранное ❤️")
+
+
+@dp.callback_query(F.data == "clear_favorites")
+async def clear_favorites(callback: CallbackQuery):
+    record = get_user_record(callback.from_user.id)
+    record["favorites"] = []
+    update_user_record(callback.from_user.id, record)
+    await callback.message.answer("❤️ Избранное очищено.")
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("shop:"))
@@ -181,8 +235,22 @@ async def add_shopping(callback: CallbackQuery):
     if not recipe:
         await callback.answer("Рецепт не найден")
         return
-    user_shopping.setdefault(callback.from_user.id, []).extend(recipe["ingredients"])
+    record = get_user_record(callback.from_user.id)
+    shopping = record.setdefault("shopping", [])
+    for item in recipe["ingredients"]:
+        if item not in shopping:
+            shopping.append(item)
+    update_user_record(callback.from_user.id, record)
     await callback.answer("Добавлено в список продуктов 🛒")
+
+
+@dp.callback_query(F.data == "clear_shopping")
+async def clear_shopping(callback: CallbackQuery):
+    record = get_user_record(callback.from_user.id)
+    record["shopping"] = []
+    update_user_record(callback.from_user.id, record)
+    await callback.message.answer("🛒 Список продуктов очищен.")
+    await callback.answer()
 
 
 async def main():
