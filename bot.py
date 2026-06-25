@@ -373,7 +373,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🍳 Завтрак"), KeyboardButton(text="🍲 Обед")],
             [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
             [KeyboardButton(text="🎲 Подобрать блюдо"), KeyboardButton(text="🔍 Поиск")],
-            [KeyboardButton(text="⚙️ Фильтры"), KeyboardButton(text="❤️ Избранное")],
+            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="❤️ Избранное")],
             [KeyboardButton(text="🏠 Главная"), KeyboardButton(text="🛒 Список продуктов")],
             [KeyboardButton(text="🥶 Холодильник"), KeyboardButton(text="👥 Профили")],
         ],
@@ -622,6 +622,43 @@ def filter_results_keyboard(kind: str, page: int = 0) -> InlineKeyboardMarkup:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="⚙️ Все фильтры", callback_data="filters:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:notifications")],
+            [InlineKeyboardButton(text="🔍 Фильтры поиска", callback_data="filters:menu")],
+            [InlineKeyboardButton(text="👥 Профили", callback_data="settings:profiles")],
+            [InlineKeyboardButton(text="ℹ️ О боте", callback_data="settings:about")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
+    )
+
+
+def settings_text() -> str:
+    return "⚙️ <b>Настройки</b>\n\nЧто хотите настроить?"
+
+
+def about_text(user_id: int) -> str:
+    return (
+        "🍽 <b>Что готовим?</b>\n\n"
+        "Версия: <b>1.2</b>\n"
+        f"📖 Рецептов: <b>{len(RECIPES)}</b>\n"
+        f"❤️ В избранном: <b>{len(get_favorites(user_id))}</b>\n"
+        f"🥶 В холодильнике: <b>{len(get_fridge_items(user_id))}</b> продуктов\n"
+        f"🛒 В покупках: <b>{len(get_shopping_items(user_id))}</b> продуктов\n\n"
+        "Домашний помощник для выбора блюд."
+    )
+
+
+def back_to_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
+    )
 
 
 def format_filter_results(kind: str, page: int = 0) -> str:
@@ -928,6 +965,16 @@ async def home_from_keyboard(message: Message):
     await send_home_screen(message)
 
 
+@dp.callback_query(F.data == "home:main")
+async def home_from_callback(callback: CallbackQuery):
+    await callback.message.answer(
+        format_home_text(),
+        reply_markup=home_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 @dp.message(F.text.in_(list(TEXT_TO_CATEGORY.keys())))
 async def category_from_keyboard(message: Message):
     category = TEXT_TO_CATEGORY[message.text]
@@ -971,19 +1018,59 @@ async def search_message(message: Message):
 
 
 
-@dp.message(F.text == "⚙️ Фильтры")
-async def filters_message(message: Message):
+@dp.message(F.text.in_(["⚙️ Настройки", "⚙️ Фильтры"]))
+async def settings_message(message: Message):
     await message.answer(
-        "⚙️ <b>Фильтры</b>\n\nВыбери, какие блюда показать:",
-        reply_markup=filter_menu_keyboard(),
+        settings_text(),
+        reply_markup=settings_keyboard(),
         parse_mode="HTML",
     )
+
+
+@dp.callback_query(F.data == "settings:menu")
+async def settings_menu_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        settings_text(),
+        reply_markup=settings_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings:notifications")
+async def settings_notifications_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🔔 <b>Уведомления</b>\n\n🚧 Скоро появится. Здесь настроим напоминания на завтрак, обед и ужин.",
+        reply_markup=back_to_settings_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings:profiles")
+async def settings_profiles_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        format_profile_summary(callback.from_user.id),
+        reply_markup=back_to_settings_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings:about")
+async def settings_about_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        about_text(callback.from_user.id),
+        reply_markup=back_to_settings_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "filters:menu")
 async def filters_menu_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "⚙️ <b>Фильтры</b>\n\nВыбери, какие блюда показать:",
+        "🔍 <b>Фильтры поиска</b>\n\nВыбери, какие блюда показать:",
         reply_markup=filter_menu_keyboard(),
         parse_mode="HTML",
     )
