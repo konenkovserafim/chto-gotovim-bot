@@ -182,6 +182,14 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, profile_code)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_flags (
+                user_id INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (user_id, key)
+            )
+        """)
         for recipe in recipes:
             conn.execute(
                 """
@@ -290,6 +298,24 @@ def toggle_fridge_item_db(user_id: int, product_code: str) -> list[str]:
 def clear_fridge_db(user_id: int) -> None:
     with db_connect() as conn:
         conn.execute("DELETE FROM fridge_items WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def get_user_flag(user_id: int, key: str) -> str | None:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM user_flags WHERE user_id = ? AND key = ?",
+            (user_id, key),
+        ).fetchone()
+    return str(row["value"]) if row else None
+
+
+def set_user_flag(user_id: int, key: str, value: str) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO user_flags (user_id, key, value) VALUES (?, ?, ?)",
+            (user_id, key, value),
+        )
         conn.commit()
 
 
@@ -878,14 +904,7 @@ def recommendation_keyboard(recipe: dict[str, Any]) -> InlineKeyboardMarkup:
 dp = Dispatcher()
 
 
-async def show_home_screen(message: Message, refresh_keyboard: bool = False):
-    if refresh_keyboard:
-        try:
-            keyboard_message = await message.answer("⌨️", reply_markup=main_keyboard())
-            await keyboard_message.delete()
-        except Exception:
-            pass
-
+async def send_home_screen(message: Message) -> None:
     await message.answer(
         format_home_text(),
         reply_markup=home_keyboard(),
@@ -895,12 +914,18 @@ async def show_home_screen(message: Message, refresh_keyboard: bool = False):
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    await show_home_screen(message, refresh_keyboard=True)
+    await send_home_screen(message)
+
+    # Один раз отправляем Reply-клавиатуру, чтобы появилась кнопка «🏠 Главная».
+    # Дальше главный экран открывается без лишних сообщений.
+    if get_user_flag(message.from_user.id, "reply_keyboard_home_v1") != "1":
+        await message.answer("⌨️ Клавиатура обновлена", reply_markup=main_keyboard())
+        set_user_flag(message.from_user.id, "reply_keyboard_home_v1", "1")
 
 
 @dp.message(F.text == "🏠 Главная")
 async def home_from_keyboard(message: Message):
-    await show_home_screen(message)
+    await send_home_screen(message)
 
 
 @dp.message(F.text.in_(list(TEXT_TO_CATEGORY.keys())))
