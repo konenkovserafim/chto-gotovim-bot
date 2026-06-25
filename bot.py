@@ -289,7 +289,8 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🍳 Завтрак"), KeyboardButton(text="🍲 Обед")],
             [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
             [KeyboardButton(text="🎲 Что приготовить?"), KeyboardButton(text="🔍 Поиск")],
-            [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="🛒 Список продуктов")],
+            [KeyboardButton(text="⚙️ Фильтры"), KeyboardButton(text="❤️ Избранное")],
+            [KeyboardButton(text="🛒 Список продуктов")],
             [KeyboardButton(text="🥶 Холодильник")],
         ],
         resize_keyboard=True,
@@ -473,6 +474,88 @@ def format_fridge_results(selected_codes: list[str], results: dict[str, list[tup
 SEARCH_WAITING: set[int] = set()
 
 
+FILTERS = {
+    "time30": {"title": "⏱ До 30 минут", "desc": "Быстрые блюда, которые готовятся до 30 минут."},
+    "cheap500": {"title": "💰 До 500 ₽", "desc": "Блюда примерно до 500 ₽ на двоих."},
+    "low500": {"title": "🔥 До 500 ккал", "desc": "Более лёгкие блюда до 500 ккал на двоих."},
+    "protein": {"title": "🥩 Высокобелковые", "desc": "Блюда с курицей, рыбой, яйцами, творогом, мясом или бобовыми."},
+    "nopork": {"title": "🚫 Без свинины", "desc": "Рецепты без свинины, бекона, ветчины и колбасы."},
+    "light": {"title": "🥗 Полегче", "desc": "Лёгкие блюда: салаты, творог, рыба, овощи и блюда до 550 ккал."},
+}
+
+
+def filter_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=data["title"], callback_data=f"filter:{key}:0")] for key, data in FILTERS.items()]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def recipe_text_blob(recipe: dict[str, Any]) -> str:
+    parts = [recipe.get("name", "")]
+    parts.extend(recipe.get("ingredients", []))
+    parts.extend(recipe.get("steps", []))
+    parts.extend(recipe.get("tags", []))
+    return " ".join(parts).lower()
+
+
+def get_filtered_recipes(kind: str) -> list[dict[str, Any]]:
+    result = []
+    for r in RECIPES:
+        text = recipe_text_blob(r)
+        calories = int(r.get("calories", 0) or 0)
+        price = int(r.get("price", 0) or 0)
+        time = int(r.get("time", 0) or 0)
+
+        if kind == "time30" and time <= 30:
+            result.append(r)
+        elif kind == "cheap500" and price <= 500:
+            result.append(r)
+        elif kind == "low500" and calories <= 500:
+            result.append(r)
+        elif kind == "protein" and any(word in text for word in ["куриц", "индейк", "рыб", "творог", "яйц", "говядин", "фарш", "фасол", "тунец"]):
+            result.append(r)
+        elif kind == "nopork" and not any(word in text for word in ["свинин", "бекон", "ветчин", "колбас", "сосиск"]):
+            result.append(r)
+        elif kind == "light" and (calories <= 550 or any(word in text for word in ["салат", "творог", "рыб", "овощ", "кефир", "йогурт"])):
+            result.append(r)
+    return result
+
+
+def filter_results_keyboard(kind: str, page: int = 0) -> InlineKeyboardMarkup:
+    results = get_filtered_recipes(kind)
+    start = page * PAGE_SIZE
+    chunk = results[start:start + PAGE_SIZE]
+    rows = [
+        [InlineKeyboardButton(text=r["name"], callback_data=f"filterrecipe:{r['id']}:{kind}:{page}")]
+        for r in chunk
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"filter:{kind}:{page-1}"))
+    if start + PAGE_SIZE < len(results):
+        nav.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"filter:{kind}:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⚙️ Все фильтры", callback_data="filters:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_filter_results(kind: str, page: int = 0) -> str:
+    if kind not in FILTERS:
+        return "⚙️ Фильтр не найден."
+    results = get_filtered_recipes(kind)
+    pages = max(1, (len(results) + PAGE_SIZE - 1) // PAGE_SIZE)
+    data = FILTERS[kind]
+    if not results:
+        return f"⚙️ <b>{data['title']}</b>\n\nПо этому фильтру пока ничего не нашёл."
+    return (
+        f"⚙️ <b>{data['title']}</b>\n\n"
+        f"{data['desc']}\n\n"
+        f"Найдено рецептов: <b>{len(results)}</b>\n"
+        f"Страница {page + 1}/{pages}.\n\n"
+        "Выбери блюдо."
+    )
+
+
 def normalize_text(value: str) -> str:
     return (value or "").lower().replace("ё", "е").strip()
 
@@ -610,6 +693,55 @@ async def search_message(message: Message):
         "• творог",
         parse_mode="HTML",
     )
+
+
+
+@dp.message(F.text == "⚙️ Фильтры")
+async def filters_message(message: Message):
+    await message.answer(
+        "⚙️ <b>Фильтры</b>\n\nВыбери, какие блюда показать:",
+        reply_markup=filter_menu_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data == "filters:menu")
+async def filters_menu_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "⚙️ <b>Фильтры</b>\n\nВыбери, какие блюда показать:",
+        reply_markup=filter_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("filter:"))
+async def filter_callback(callback: CallbackQuery):
+    _, kind, page_s = callback.data.split(":")
+    page = int(page_s)
+    await callback.message.edit_text(
+        format_filter_results(kind, page),
+        reply_markup=filter_results_keyboard(kind, page),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("filterrecipe:"))
+async def filter_recipe_callback(callback: CallbackQuery):
+    _, recipe_id_s, kind, page_s = callback.data.split(":")
+    recipe_id = int(recipe_id_s)
+    page = int(page_s)
+    recipe = RECIPES_BY_ID.get(recipe_id)
+    if not recipe:
+        await callback.answer("Рецепт не найден", show_alert=True)
+        return
+    await callback.message.edit_text(
+        format_recipe(recipe),
+        reply_markup=recipe_actions_keyboard(recipe_id, recipe.get("category"), 0),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @dp.message(F.text == "❤️ Избранное")
