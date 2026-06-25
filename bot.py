@@ -49,15 +49,23 @@ def recipes_by_category(category: str) -> List[Dict[str, Any]]:
 def recipe_card(recipe: Dict[str, Any]) -> str:
     ingredients = "\n".join(f"• {item}" for item in recipe["ingredients"])
     steps = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(recipe["steps"]))
-    portions = recipe.get("portions", "Серафиму — порция побольше, Тане — чуть легче.")
+    portions = recipe.get("portions", "👨 Серафим — порция побольше.\n👩 Таня — порция чуть легче.")
+    protein = recipe.get("protein", "—")
+    fats = recipe.get("fats", "—")
+    carbs = recipe.get("carbs", "—")
+    note = recipe.get("note", "")
+    note_block = f"\n\n💬 <b>Заметка</b>\n{note}" if note else ""
     return (
         f"{recipe['emoji']} <b>{recipe['title']}</b>\n\n"
-        f"⏱ Время: {recipe['time']}\n"
-        f"🔥 Примерно: {recipe['calories']}\n"
-        f"💰 Стоимость: {recipe.get('price', 'примерно')}\n\n"
+        f"⏱ <b>Время:</b> {recipe['time']}\n"
+        f"🔥 <b>Калорийность:</b> {recipe['calories']}\n"
+        f"💰 <b>Стоимость:</b> {recipe.get('price', 'примерно')}\n"
+        f"🥩 <b>БЖУ:</b> Б {protein} / Ж {fats} / У {carbs}\n"
+        f"━━━━━━━━━━━━━━\n"
         f"👫 <b>Порции</b>\n{portions}\n\n"
         f"🛒 <b>Ингредиенты на двоих</b>\n{ingredients}\n\n"
-        f"👨‍🍳 <b>Рецепт</b>\n{steps}"
+        f"👨‍🍳 <b>Приготовление</b>\n{steps}"
+        f"{note_block}"
     )
 
 
