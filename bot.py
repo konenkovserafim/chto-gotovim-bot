@@ -501,6 +501,30 @@ def get_top_rated_recipe(user_id: int) -> dict[str, Any] | None:
     return RECIPES_BY_ID.get(int(row["recipe_id"]))
 
 
+def get_recent_cooked_recipe_ids(user_id: int, limit: int = 5) -> set[int]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT recipe_id
+            FROM cooking_history
+            WHERE user_id = ?
+            ORDER BY cooked_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+    return {int(row["recipe_id"]) for row in rows}
+
+
+def get_user_ratings(user_id: int) -> dict[int, int]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT recipe_id, rating FROM recipe_ratings WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+    return {int(row["recipe_id"]): int(row["rating"]) for row in rows}
+
+
 DEFAULT_PROFILES = [
     {
         "code": "serafim",
@@ -1085,16 +1109,22 @@ def home_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def recommend_recipe(user_id: int) -> tuple[dict[str, Any], list[str]]:
+def recommend_recipe(user_id: int, exclude_recipe_id: int | None = None) -> tuple[dict[str, Any], list[str]]:
     target_category = current_meal_category()
     selected = set(get_fridge_items(user_id))
     favorites = set(get_favorites(user_id))
+    recent = get_recent_cooked_recipe_ids(user_id, limit=5)
+    ratings = get_user_ratings(user_id)
     candidates = recipes_for_category(target_category) or RECIPES
 
     scored = []
     for recipe in candidates:
+        recipe_id = int(recipe.get("id", 0))
         score = 0
         reasons = []
+
+        if exclude_recipe_id and recipe_id == exclude_recipe_id and len(candidates) > 1:
+            score -= 1000
 
         required = detected_product_codes(recipe)
         matched = required & selected
@@ -1103,7 +1133,7 @@ def recommend_recipe(user_id: int) -> tuple[dict[str, Any], list[str]]:
         if selected and required:
             if not missing:
                 score += 50
-                reasons.append("✅ Все продукты уже есть в холодильнике.")
+                reasons.append("✅ Все продукты есть в холодильнике.")
             elif matched and len(missing) <= 2:
                 score += 25 - len(missing) * 5
                 missing_titles = ", ".join(FRIDGE_BY_CODE[c]["title"] for c in missing if c in FRIDGE_BY_CODE)
@@ -1112,9 +1142,21 @@ def recommend_recipe(user_id: int) -> tuple[dict[str, Any], list[str]]:
             elif matched:
                 score += 10
 
-        if int(recipe.get("id", 0)) in favorites:
+        if recipe_id in favorites:
             score += 20
-            reasons.append("❤️ Это блюдо есть в избранном.")
+            reasons.append("❤️ Есть в избранном.")
+
+        rating = ratings.get(recipe_id)
+        if rating:
+            score += rating * 4
+            if rating >= 4:
+                reasons.append(f"⭐ Вы оценили это блюдо на {rating}/5.")
+
+        if recipe_id in recent:
+            score -= 25
+        elif get_cooked_count(user_id) > 0:
+            score += 8
+            reasons.append("📖 Давно не появлялось в истории.")
 
         time = int(recipe.get("time", 0) or 0)
         if time and time <= 30:
@@ -1130,7 +1172,8 @@ def recommend_recipe(user_id: int) -> tuple[dict[str, Any], list[str]]:
 
     scored.sort(key=lambda item: (-item[0], item[1]))
     _, _, recipe, reasons = scored[0]
-    return recipe, reasons[:3]
+    set_user_flag(user_id, "last_recommendation_id", str(recipe["id"]))
+    return recipe, reasons[:4]
 
 
 def format_recommendation(recipe: dict[str, Any], reasons: list[str]) -> str:
@@ -1208,7 +1251,14 @@ async def random_recipe_message(message: Message):
 
 @dp.callback_query(F.data.startswith("recommend:"))
 async def recommend_callback(callback: CallbackQuery):
-    recipe, reasons = recommend_recipe(callback.from_user.id)
+    action = callback.data.split(":", 1)[1] if ":" in callback.data else "now"
+    exclude_recipe_id = None
+    if action == "again":
+        last_id = get_user_flag(callback.from_user.id, "last_recommendation_id")
+        if last_id and last_id.isdigit():
+            exclude_recipe_id = int(last_id)
+
+    recipe, reasons = recommend_recipe(callback.from_user.id, exclude_recipe_id=exclude_recipe_id)
     await callback.message.edit_text(
         format_recommendation(recipe, reasons),
         reply_markup=recommendation_keyboard(recipe),
