@@ -122,6 +122,16 @@ def recipe_actions_keyboard(recipe_id: int, category: str | None = None, page: i
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def favorites_keyboard(fav_ids: list[int]) -> InlineKeyboardMarkup:
+    rows = []
+    for recipe_id in fav_ids:
+        recipe = RECIPES_BY_ID.get(recipe_id)
+        if recipe:
+            rows.append([InlineKeyboardButton(text=recipe["name"], callback_data=f"favrecipe:{recipe_id}")])
+    rows.append([InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def clear_keyboard(kind: str) -> InlineKeyboardMarkup:
     if kind == "favorites":
         return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")]])
@@ -184,11 +194,11 @@ async def favorites_message(message: Message):
     if not fav_ids:
         await message.answer("❤️ В избранном пока пусто.")
         return
-    lines = ["❤️ <b>Избранное</b>", ""]
-    for recipe_id in fav_ids:
-        r = RECIPES_BY_ID[recipe_id]
-        lines.append(f"• {r['name']}")
-    await message.answer("\n".join(lines), reply_markup=clear_keyboard("favorites"), parse_mode="HTML")
+    await message.answer(
+        "❤️ <b>Избранное</b>\n\nВыбери блюдо, чтобы открыть полную карточку.",
+        reply_markup=favorites_keyboard(fav_ids),
+        parse_mode="HTML",
+    )
 
 
 @dp.message(F.text == "🛒 Список продуктов")
@@ -203,6 +213,21 @@ async def shopping_message(message: Message):
     for item in items:
         lines.append(f"• {item}")
     await message.answer("\n".join(lines), reply_markup=clear_keyboard("shopping"), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("favrecipe:"))
+async def favorite_recipe_callback(callback: CallbackQuery):
+    recipe_id = int(callback.data.split(":")[1])
+    recipe = RECIPES_BY_ID.get(recipe_id)
+    if not recipe:
+        await callback.answer("Рецепт не найден", show_alert=True)
+        return
+    await callback.message.edit_text(
+        format_recipe(recipe),
+        reply_markup=recipe_actions_keyboard(recipe_id, recipe.get("category"), 0),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("cat:"))
