@@ -360,6 +360,90 @@ def get_cooked_count(user_id: int) -> int:
     return int(row["count"] or 0) if row else 0
 
 
+
+def get_cooking_history(user_id: int, limit: int = 30) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT recipe_id, cooked_at
+            FROM cooking_history
+            WHERE user_id = ?
+            ORDER BY cooked_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+    history = []
+    for row in rows:
+        recipe = RECIPES_BY_ID.get(int(row["recipe_id"]))
+        if recipe:
+            history.append({"recipe": recipe, "cooked_at": str(row["cooked_at"])})
+    return history
+
+
+def clear_cooking_history(user_id: int) -> None:
+    with db_connect() as conn:
+        conn.execute("DELETE FROM cooking_history WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def format_history_date(cooked_at: str) -> str:
+    tz = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Moscow"))
+    try:
+        dt = datetime.fromisoformat(cooked_at).astimezone(tz)
+    except ValueError:
+        return "Без даты"
+
+    today = datetime.now(tz).date()
+    cooked_date = dt.date()
+    if cooked_date == today:
+        return "Сегодня"
+    if (today - cooked_date).days == 1:
+        return "Вчера"
+    return dt.strftime("%d.%m.%Y")
+
+
+def format_history(user_id: int) -> str:
+    items = get_cooking_history(user_id, 30)
+    if not items:
+        return (
+            "📖 <b>История приготовлений</b>\n\n"
+            "Пока здесь пусто.\n\n"
+            "Когда нажмёшь <b>✅ Приготовили</b> в карточке рецепта, блюдо появится здесь."
+        )
+
+    lines = ["📖 <b>История приготовлений</b>", ""]
+    current_group = None
+    for item in items:
+        group = format_history_date(item["cooked_at"])
+        recipe = item["recipe"]
+        if group != current_group:
+            if current_group is not None:
+                lines.append("")
+            lines.append(f"<b>{group}</b>")
+            current_group = group
+        lines.append(f"• {recipe['name']}")
+    return "\n".join(lines)
+
+
+def history_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧹 Очистить историю", callback_data="history:clear")],
+            [InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
+    )
+
+
+def confirm_clear_history_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, очистить", callback_data="history:clear_confirm")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:history")],
+        ]
+    )
+
 def get_top_cooked_recipe(user_id: int) -> dict[str, Any] | None:
     with db_connect() as conn:
         row = conn.execute(
@@ -747,6 +831,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:notifications")],
+            [InlineKeyboardButton(text="📖 История приготовлений", callback_data="settings:history")],
             [InlineKeyboardButton(text="🔍 Фильтры поиска", callback_data="filters:menu")],
             [InlineKeyboardButton(text="👥 Профили", callback_data="settings:profiles")],
             [InlineKeyboardButton(text="ℹ️ О боте", callback_data="settings:about")],
@@ -1175,6 +1260,37 @@ async def settings_notifications_callback(callback: CallbackQuery):
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data == "settings:history")
+async def settings_history_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        format_history(callback.from_user.id),
+        reply_markup=history_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "history:clear")
+async def history_clear_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🧹 <b>Очистить историю?</b>\n\nЭто удалит список приготовленных блюд. Оценки рецептов останутся.",
+        reply_markup=confirm_clear_history_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "history:clear_confirm")
+async def history_clear_confirm_callback(callback: CallbackQuery):
+    clear_cooking_history(callback.from_user.id)
+    await callback.message.edit_text(
+        "📖 <b>История приготовлений</b>\n\nИстория очищена.",
+        reply_markup=history_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer("История очищена")
 
 
 @dp.callback_query(F.data == "settings:profiles")
