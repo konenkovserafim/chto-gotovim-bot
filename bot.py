@@ -348,8 +348,8 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
             [KeyboardButton(text="🎲 Подобрать блюдо"), KeyboardButton(text="🔍 Поиск")],
             [KeyboardButton(text="⚙️ Фильтры"), KeyboardButton(text="❤️ Избранное")],
-            [KeyboardButton(text="🛒 Список продуктов"), KeyboardButton(text="🥶 Холодильник")],
-            [KeyboardButton(text="👥 Профили")],
+            [KeyboardButton(text="🏠 Главная"), KeyboardButton(text="🛒 Список продуктов")],
+            [KeyboardButton(text="🥶 Холодильник"), KeyboardButton(text="👥 Профили")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери раздел",
@@ -878,13 +878,29 @@ def recommendation_keyboard(recipe: dict[str, Any]) -> InlineKeyboardMarkup:
 dp = Dispatcher()
 
 
-@dp.message(CommandStart())
-async def start(message: Message):
+async def show_home_screen(message: Message, refresh_keyboard: bool = False):
+    if refresh_keyboard:
+        try:
+            keyboard_message = await message.answer("⌨️", reply_markup=main_keyboard())
+            await keyboard_message.delete()
+        except Exception:
+            pass
+
     await message.answer(
         format_home_text(),
         reply_markup=home_keyboard(),
         parse_mode="HTML",
     )
+
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    await show_home_screen(message, refresh_keyboard=True)
+
+
+@dp.message(F.text == "🏠 Главная")
+async def home_from_keyboard(message: Message):
+    await show_home_screen(message)
 
 
 @dp.message(F.text.in_(list(TEXT_TO_CATEGORY.keys())))
