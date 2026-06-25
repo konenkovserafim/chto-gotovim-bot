@@ -885,7 +885,6 @@ async def start(message: Message):
         reply_markup=home_keyboard(),
         parse_mode="HTML",
     )
-    await message.answer("Выбери раздел на клавиатуре 👇", reply_markup=main_keyboard())
 
 
 @dp.message(F.text.in_(list(TEXT_TO_CATEGORY.keys())))
@@ -1230,7 +1229,6 @@ async def fallback(message: Message):
             parse_mode="HTML",
         )
         return
-    await message.answer("Выбери раздел на клавиатуре 👇", reply_markup=main_keyboard())
 
 
 async def main():
