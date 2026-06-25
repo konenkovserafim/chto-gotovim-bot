@@ -643,12 +643,21 @@ def settings_text() -> str:
 def about_text(user_id: int) -> str:
     return (
         "🍽 <b>Что готовим?</b>\n\n"
-        "Версия: <b>1.2</b>\n"
+        "Версия <b>1.5</b>\n\n"
+        "Домашний помощник для выбора блюд.\n\n"
+        "Разработано с ❤️\n"
+        "для Серафима и Тани.\n\n"
         f"📖 Рецептов: <b>{len(RECIPES)}</b>\n"
-        f"❤️ В избранном: <b>{len(get_favorites(user_id))}</b>\n"
-        f"🥶 В холодильнике: <b>{len(get_fridge_items(user_id))}</b> продуктов\n"
-        f"🛒 В покупках: <b>{len(get_shopping_items(user_id))}</b> продуктов\n\n"
-        "Домашний помощник для выбора блюд."
+        "🍳 Приготовлено: <b>42 блюда</b>\n"
+        "❤️ Любимое: <b>Сырники</b>"
+    )
+
+
+def about_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
     )
 
 
@@ -1061,7 +1070,7 @@ async def settings_profiles_callback(callback: CallbackQuery):
 async def settings_about_callback(callback: CallbackQuery):
     await callback.message.edit_text(
         about_text(callback.from_user.id),
-        reply_markup=back_to_settings_keyboard(),
+        reply_markup=about_keyboard(),
         parse_mode="HTML",
     )
     await callback.answer()
