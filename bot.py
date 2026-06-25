@@ -24,14 +24,22 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Add it in Railway Variables.")
 
 BASE_DIR = Path(__file__).parent
-RECIPES_FILE = BASE_DIR / "recipes.json"
+RECIPES_DIR = BASE_DIR / "recipes"
 STATE_FILE = BASE_DIR / "state.json"
+PAGE_SIZE = 10
 
 CATEGORY_TITLES = {
     "breakfast": "🍳 Завтрак",
     "lunch": "🍲 Обед",
     "dinner": "🍽 Ужин",
     "snack": "🥗 Перекус",
+}
+
+CATEGORY_FILES = {
+    "breakfast": "breakfasts.json",
+    "lunch": "lunches.json",
+    "dinner": "dinners.json",
+    "snack": "snacks.json",
 }
 
 CATEGORY_BY_BUTTON = {v: k for k, v in CATEGORY_TITLES.items()}
@@ -48,8 +56,12 @@ main_keyboard = ReplyKeyboardMarkup(
 
 
 def load_recipes() -> dict[str, list[dict[str, Any]]]:
-    with RECIPES_FILE.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    recipes: dict[str, list[dict[str, Any]]] = {}
+    for category, filename in CATEGORY_FILES.items():
+        path = RECIPES_DIR / filename
+        with path.open("r", encoding="utf-8") as f:
+            recipes[category] = json.load(f)
+    return recipes
 
 
 def load_state() -> dict[str, Any]:
@@ -81,29 +93,39 @@ def all_recipes() -> list[dict[str, Any]]:
     result = []
     for category, items in RECIPES.items():
         for item in items:
-            item = dict(item)
-            item["category"] = category
-            result.append(item)
+            recipe = dict(item)
+            recipe["category"] = category
+            result.append(recipe)
     return result
 
 
 def find_recipe(recipe_id: str) -> dict[str, Any] | None:
     for recipe in all_recipes():
-        if recipe["id"] == recipe_id:
+        if recipe.get("id") == recipe_id:
             return recipe
     return None
 
 
 def user_id(obj: Message | CallbackQuery) -> str:
-    if isinstance(obj, CallbackQuery):
-        return str(obj.from_user.id)
     return str(obj.from_user.id)
 
 
-def category_keyboard(category: str) -> InlineKeyboardMarkup:
+def category_keyboard(category: str, page: int = 0) -> InlineKeyboardMarkup:
+    items = RECIPES.get(category, [])
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
     rows = []
-    for recipe in RECIPES.get(category, []):
+    for recipe in items[start:end]:
         rows.append([InlineKeyboardButton(text=recipe["title"], callback_data=f"recipe:{recipe['id']}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cat:{category}:{page-1}"))
+    if end < len(items):
+        nav.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"cat:{category}:{page+1}"))
+    if nav:
+        rows.append(nav)
+
     rows.append([InlineKeyboardButton(text="🎲 Случайное из раздела", callback_data=f"randomcat:{category}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -119,7 +141,7 @@ def recipe_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
 
 def shopping_keyboard(items: list[str]) -> InlineKeyboardMarkup | None:
     rows = []
-    for idx, item in enumerate(items):
+    for idx, item in enumerate(items[:30]):
         rows.append([InlineKeyboardButton(text=f"❌ {item}", callback_data=f"delshop:{idx}")])
     if items:
         rows.append([InlineKeyboardButton(text="🧹 Очистить список", callback_data="clearshop")])
@@ -129,10 +151,15 @@ def shopping_keyboard(items: list[str]) -> InlineKeyboardMarkup | None:
 def format_recipe(recipe: dict[str, Any]) -> str:
     ingredients = "\n".join(f"• {x}" for x in recipe.get("ingredients", []))
     steps = "\n".join(f"{i}. {x}" for i, x in enumerate(recipe.get("steps", []), start=1))
+    bju = ""
+    if all(k in recipe for k in ["proteins", "fats", "carbs"]):
+        bju = f"\n🥩 Б: {recipe['proteins']} г  🧈 Ж: {recipe['fats']} г  🍚 У: {recipe['carbs']} г"
     return (
         f"{recipe['title']}\n\n"
         f"⏱ Время: {recipe.get('time', '—')}\n"
-        f"🔥 Калорийность: {recipe.get('calories', '—')}\n\n"
+        f"💰 Стоимость: {recipe.get('price', '—')}\n"
+        f"🔥 Калорийность: {recipe.get('calories', '—')}"
+        f"{bju}\n\n"
         f"🛒 Ингредиенты:\n{ingredients}\n\n"
         f"👨‍🍳 Приготовление:\n{steps}"
     )
@@ -144,9 +171,10 @@ dp = Dispatcher()
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    total = len(all_recipes())
     await message.answer(
         "🍽 Привет! Я бот «Что готовим?»\n\n"
-        "Помогу выбрать завтрак, обед, ужин или перекус для вас с Таней.",
+        f"В базе уже {total} рецептов. Выбери раздел кнопками ниже 👇",
         reply_markup=main_keyboard,
     )
 
@@ -155,9 +183,20 @@ async def start(message: Message):
 async def show_category(message: Message):
     category = CATEGORY_BY_BUTTON[message.text]
     await message.answer(
-        f"{CATEGORY_TITLES[category]}\n\nВыбери блюдо:",
-        reply_markup=category_keyboard(category),
+        f"{CATEGORY_TITLES[category]}\n\nВыбери блюдо. Показываю по {PAGE_SIZE} рецептов на страницу:",
+        reply_markup=category_keyboard(category, 0),
     )
+
+
+@dp.callback_query(F.data.startswith("cat:"))
+async def cb_category_page(callback: CallbackQuery):
+    _, category, page_str = callback.data.split(":")
+    page = int(page_str)
+    await callback.message.edit_text(
+        f"{CATEGORY_TITLES[category]}\n\nВыбери блюдо. Страница {page + 1}:",
+        reply_markup=category_keyboard(category, page),
+    )
+    await callback.answer()
 
 
 @dp.message(F.text == "🎲 Что приготовить?")
@@ -170,11 +209,11 @@ async def random_any(message: Message):
 async def favorites(message: Message):
     state = load_state()
     ids = state["favorites"].get(user_id(message), [])
-    if not ids:
-        await message.answer("❤️ В избранном пока пусто.")
-        return
     recipes = [find_recipe(rid) for rid in ids]
     recipes = [r for r in recipes if r]
+    if not recipes:
+        await message.answer("❤️ В избранном пока пусто.")
+        return
     text = "❤️ Избранное:\n\n" + "\n".join(f"• {r['title']}" for r in recipes)
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=r["title"], callback_data=f"recipe:{r['id']}")] for r in recipes]
@@ -188,7 +227,7 @@ async def shopping(message: Message):
     state = load_state()
     items = state["shopping"].get(user_id(message), [])
     if not items:
-        await message.answer("🛒 Список продуктов пока пуст.\n\nЧтобы добавить продукты, открой блюдо и нажми «В список продуктов».")
+        await message.answer("🛒 Список продуктов пока пуст.\n\nОткрой блюдо и нажми «В список продуктов».")
         return
     text = "🛒 Список продуктов:\n\n" + "\n".join(f"• {x}" for x in items)
     await message.answer(text, reply_markup=shopping_keyboard(items))
