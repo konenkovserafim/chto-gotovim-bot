@@ -12,21 +12,21 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
-    KeyboardButton,
 )
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Add it in Railway Variables.")
 
-BASE_DIR = Path(__file__).parent
-RECIPES_DIR = BASE_DIR / "recipes"
-STATE_FILE = BASE_DIR / "state.json"
-PAGE_SIZE = 10
+RECIPES_PATH = Path("recipes.json")
+DATA_PATH = Path("user_data.json")
+PAGE_SIZE = 8
 
 CATEGORY_TITLES = {
     "breakfast": "🍳 Завтрак",
@@ -34,94 +34,73 @@ CATEGORY_TITLES = {
     "dinner": "🍽 Ужин",
     "snack": "🥗 Перекус",
 }
-
-CATEGORY_FILES = {
-    "breakfast": "breakfasts.json",
-    "lunch": "lunches.json",
-    "dinner": "dinners.json",
-    "snack": "snacks.json",
-}
-
-CATEGORY_BY_BUTTON = {v: k for k, v in CATEGORY_TITLES.items()}
-
-main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🍳 Завтрак"), KeyboardButton(text="🍲 Обед")],
-        [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
-        [KeyboardButton(text="🎲 Что приготовить?")],
-        [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="🛒 Список продуктов")],
-    ],
-    resize_keyboard=True,
-)
+TEXT_TO_CATEGORY = {v: k for k, v in CATEGORY_TITLES.items()}
 
 
-def load_recipes() -> dict[str, list[dict[str, Any]]]:
-    recipes: dict[str, list[dict[str, Any]]] = {}
-    for category, filename in CATEGORY_FILES.items():
-        path = RECIPES_DIR / filename
-        with path.open("r", encoding="utf-8") as f:
-            recipes[category] = json.load(f)
-    return recipes
-
-
-def load_state() -> dict[str, Any]:
-    if not STATE_FILE.exists():
-        return {"favorites": {}, "shopping": {}}
-    try:
-        with STATE_FILE.open("r", encoding="utf-8") as f:
-            state = json.load(f)
-        state.setdefault("favorites", {})
-        state.setdefault("shopping", {})
-        return state
-    except Exception:
-        logging.exception("Failed to read state.json")
-        return {"favorites": {}, "shopping": {}}
-
-
-def save_state(state: dict[str, Any]) -> None:
-    try:
-        with STATE_FILE.open("w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        logging.exception("Failed to save state.json")
+def load_recipes() -> list[dict[str, Any]]:
+    with RECIPES_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 RECIPES = load_recipes()
+RECIPES_BY_ID = {int(r["id"]): r for r in RECIPES}
 
 
-def all_recipes() -> list[dict[str, Any]]:
-    result = []
-    for category, items in RECIPES.items():
-        for item in items:
-            recipe = dict(item)
-            recipe["category"] = category
-            result.append(recipe)
-    return result
+def load_data() -> dict[str, Any]:
+    if not DATA_PATH.exists():
+        return {}
+    try:
+        with DATA_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logger.exception("Failed to load user_data.json")
+        return {}
 
 
-def find_recipe(recipe_id: str) -> dict[str, Any] | None:
-    for recipe in all_recipes():
-        if recipe.get("id") == recipe_id:
-            return recipe
-    return None
+def save_data(data: dict[str, Any]) -> None:
+    with DATA_PATH.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def user_id(obj: Message | CallbackQuery) -> str:
-    return str(obj.from_user.id)
+def get_user(data: dict[str, Any], user_id: int) -> dict[str, Any]:
+    key = str(user_id)
+    if key not in data:
+        data[key] = {"favorites": [], "shopping": []}
+    data[key].setdefault("favorites", [])
+    data[key].setdefault("shopping", [])
+    return data[key]
 
 
-def category_keyboard(category: str, page: int = 0) -> InlineKeyboardMarkup:
-    items = RECIPES.get(category, [])
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🍳 Завтрак"), KeyboardButton(text="🍲 Обед")],
+            [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
+            [KeyboardButton(text="🎲 Что приготовить?")],
+            [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="🛒 Список продуктов")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выбери раздел",
+    )
+
+
+def recipes_for_category(category: str) -> list[dict[str, Any]]:
+    return [r for r in RECIPES if r.get("category") == category]
+
+
+def recipe_list_keyboard(category: str, page: int = 0) -> InlineKeyboardMarkup:
+    items = recipes_for_category(category)
     start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    rows = []
-    for recipe in items[start:end]:
-        rows.append([InlineKeyboardButton(text=recipe["title"], callback_data=f"recipe:{recipe['id']}")])
+    chunk = items[start:start + PAGE_SIZE]
+    rows = [
+        [InlineKeyboardButton(text=f"{r['name']}", callback_data=f"recipe:{r['id']}:{category}:{page}")]
+        for r in chunk
+    ]
 
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cat:{category}:{page-1}"))
-    if end < len(items):
+    if start + PAGE_SIZE < len(items):
         nav.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"cat:{category}:{page+1}"))
     if nav:
         rows.append(nav)
@@ -130,203 +109,193 @@ def category_keyboard(category: str, page: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def recipe_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="❤️ В избранное", callback_data=f"fav:{recipe_id}")],
-            [InlineKeyboardButton(text="🛒 В список продуктов", callback_data=f"shop:{recipe_id}")],
+def recipe_actions_keyboard(recipe_id: int, category: str | None = None, page: int = 0) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="❤️ В избранное", callback_data=f"fav:{recipe_id}"),
+            InlineKeyboardButton(text="🛒 В список", callback_data=f"shop:{recipe_id}"),
         ]
-    )
+    ]
+    if category:
+        rows.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"cat:{category}:{page}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def shopping_keyboard(items: list[str]) -> InlineKeyboardMarkup | None:
-    rows = []
-    for idx, item in enumerate(items[:30]):
-        rows.append([InlineKeyboardButton(text=f"❌ {item}", callback_data=f"delshop:{idx}")])
-    if items:
-        rows.append([InlineKeyboardButton(text="🧹 Очистить список", callback_data="clearshop")])
-    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+def clear_keyboard(kind: str) -> InlineKeyboardMarkup:
+    if kind == "favorites":
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear:shopping")]])
 
 
-def format_recipe(recipe: dict[str, Any]) -> str:
-    ingredients = "\n".join(f"• {x}" for x in recipe.get("ingredients", []))
-    steps = "\n".join(f"{i}. {x}" for i, x in enumerate(recipe.get("steps", []), start=1))
-    bju = ""
-    if all(k in recipe for k in ["proteins", "fats", "carbs"]):
-        bju = f"\n🥩 Б: {recipe['proteins']} г  🧈 Ж: {recipe['fats']} г  🍚 У: {recipe['carbs']} г"
+def format_recipe(r: dict[str, Any]) -> str:
+    ingredients = "\n".join(f"• {item}" for item in r.get("ingredients", []))
+    steps = "\n".join(f"{i}. {step}" for i, step in enumerate(r.get("steps", []), 1))
+    tags = ", ".join(r.get("tags", []))
+
     return (
-        f"{recipe['title']}\n\n"
-        f"⏱ Время: {recipe.get('time', '—')}\n"
-        f"💰 Стоимость: {recipe.get('price', '—')}\n"
-        f"🔥 Калорийность: {recipe.get('calories', '—')}"
-        f"{bju}\n\n"
-        f"🛒 Ингредиенты:\n{ingredients}\n\n"
-        f"👨‍🍳 Приготовление:\n{steps}"
+        f"🍽 <b>{r['name']}</b>\n\n"
+        f"⏱ Время: {r.get('time', '—')} мин\n"
+        f"🔥 Калорийность на двоих: ~{r.get('calories', '—')} ккал\n"
+        f"💰 Примерно: ~{r.get('price', '—')} ₽\n"
+        f"🍳 Сложность: {r.get('difficulty', 'Легко')}\n\n"
+        f"🛒 <b>Ингредиенты</b>\n{ingredients}\n\n"
+        f"👨‍🍳 <b>Приготовление</b>\n{steps}\n\n"
+        f"🏷 {tags}"
     )
 
 
-bot = Bot(token=TOKEN)
+def format_category(category: str, page: int = 0) -> str:
+    total = len(recipes_for_category(category))
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    return f"{CATEGORY_TITLES[category]}\n\nВыбери блюдо.\nСтраница {page + 1}/{pages}. Всего рецептов: {total}."
+
+
 dp = Dispatcher()
 
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    total = len(all_recipes())
     await message.answer(
-        "🍽 Привет! Я бот «Что готовим?»\n\n"
-        f"В базе уже {total} рецептов. Выбери раздел кнопками ниже 👇",
-        reply_markup=main_keyboard,
+        "🍽 <b>Привет! Я бот «Что готовим?»</b>\n\n"
+        "Помогу выбрать завтрак, обед, ужин или перекус для вас с Таней.\n\n"
+        f"Сейчас в базе: <b>{len(RECIPES)} рецептов</b>.",
+        reply_markup=main_keyboard(),
     )
 
 
-@dp.message(F.text.in_(list(CATEGORY_BY_BUTTON.keys())))
-async def show_category(message: Message):
-    category = CATEGORY_BY_BUTTON[message.text]
-    await message.answer(
-        f"{CATEGORY_TITLES[category]}\n\nВыбери блюдо. Показываю по {PAGE_SIZE} рецептов на страницу:",
-        reply_markup=category_keyboard(category, 0),
-    )
-
-
-@dp.callback_query(F.data.startswith("cat:"))
-async def cb_category_page(callback: CallbackQuery):
-    _, category, page_str = callback.data.split(":")
-    page = int(page_str)
-    await callback.message.edit_text(
-        f"{CATEGORY_TITLES[category]}\n\nВыбери блюдо. Страница {page + 1}:",
-        reply_markup=category_keyboard(category, page),
-    )
-    await callback.answer()
+@dp.message(F.text.in_(list(TEXT_TO_CATEGORY.keys())))
+async def category_from_keyboard(message: Message):
+    category = TEXT_TO_CATEGORY[message.text]
+    await message.answer(format_category(category, 0), reply_markup=recipe_list_keyboard(category, 0))
 
 
 @dp.message(F.text == "🎲 Что приготовить?")
-async def random_any(message: Message):
-    recipe = random.choice(all_recipes())
-    await message.answer(format_recipe(recipe), reply_markup=recipe_keyboard(recipe["id"]))
+async def random_recipe_message(message: Message):
+    recipe = random.choice(RECIPES)
+    await message.answer(format_recipe(recipe), reply_markup=recipe_actions_keyboard(recipe["id"], recipe.get("category")), parse_mode="HTML")
 
 
 @dp.message(F.text == "❤️ Избранное")
-async def favorites(message: Message):
-    state = load_state()
-    ids = state["favorites"].get(user_id(message), [])
-    recipes = [find_recipe(rid) for rid in ids]
-    recipes = [r for r in recipes if r]
-    if not recipes:
+async def favorites_message(message: Message):
+    data = load_data()
+    user = get_user(data, message.from_user.id)
+    fav_ids = [int(x) for x in user.get("favorites", []) if int(x) in RECIPES_BY_ID]
+    if not fav_ids:
         await message.answer("❤️ В избранном пока пусто.")
         return
-    text = "❤️ Избранное:\n\n" + "\n".join(f"• {r['title']}" for r in recipes)
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=r["title"], callback_data=f"recipe:{r['id']}")] for r in recipes]
-        + [[InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clearfav")]]
-    )
-    await message.answer(text, reply_markup=keyboard)
+    lines = ["❤️ <b>Избранное</b>", ""]
+    for recipe_id in fav_ids:
+        r = RECIPES_BY_ID[recipe_id]
+        lines.append(f"• {r['name']}")
+    await message.answer("\n".join(lines), reply_markup=clear_keyboard("favorites"), parse_mode="HTML")
 
 
 @dp.message(F.text == "🛒 Список продуктов")
-async def shopping(message: Message):
-    state = load_state()
-    items = state["shopping"].get(user_id(message), [])
+async def shopping_message(message: Message):
+    data = load_data()
+    user = get_user(data, message.from_user.id)
+    items = user.get("shopping", [])
     if not items:
-        await message.answer("🛒 Список продуктов пока пуст.\n\nОткрой блюдо и нажми «В список продуктов».")
+        await message.answer("🛒 Список продуктов пока пуст.")
         return
-    text = "🛒 Список продуктов:\n\n" + "\n".join(f"• {x}" for x in items)
-    await message.answer(text, reply_markup=shopping_keyboard(items))
+    lines = ["🛒 <b>Список продуктов</b>", ""]
+    for item in items:
+        lines.append(f"• {item}")
+    await message.answer("\n".join(lines), reply_markup=clear_keyboard("shopping"), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("cat:"))
+async def category_callback(callback: CallbackQuery):
+    _, category, page_s = callback.data.split(":")
+    page = int(page_s)
+    await callback.message.edit_text(format_category(category, page), reply_markup=recipe_list_keyboard(category, page))
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("recipe:"))
-async def cb_recipe(callback: CallbackQuery):
-    recipe_id = callback.data.split(":", 1)[1]
-    recipe = find_recipe(recipe_id)
+async def recipe_callback(callback: CallbackQuery):
+    _, recipe_id_s, category, page_s = callback.data.split(":")
+    recipe_id = int(recipe_id_s)
+    page = int(page_s)
+    recipe = RECIPES_BY_ID.get(recipe_id)
     if not recipe:
         await callback.answer("Рецепт не найден", show_alert=True)
         return
-    await callback.message.answer(format_recipe(recipe), reply_markup=recipe_keyboard(recipe_id))
+    await callback.message.edit_text(
+        format_recipe(recipe),
+        reply_markup=recipe_actions_keyboard(recipe_id, category, page),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("randomcat:"))
-async def cb_random_category(callback: CallbackQuery):
-    category = callback.data.split(":", 1)[1]
-    recipe = random.choice(RECIPES.get(category, all_recipes()))
-    await callback.message.answer(format_recipe(recipe), reply_markup=recipe_keyboard(recipe["id"]))
+async def random_category_callback(callback: CallbackQuery):
+    category = callback.data.split(":")[1]
+    recipe = random.choice(recipes_for_category(category))
+    await callback.message.edit_text(
+        format_recipe(recipe),
+        reply_markup=recipe_actions_keyboard(recipe["id"], category, 0),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("fav:"))
-async def cb_fav(callback: CallbackQuery):
-    recipe_id = callback.data.split(":", 1)[1]
-    recipe = find_recipe(recipe_id)
-    if not recipe:
-        await callback.answer("Рецепт не найден", show_alert=True)
-        return
-    state = load_state()
-    uid = user_id(callback)
-    favs = state["favorites"].setdefault(uid, [])
-    if recipe_id not in favs:
-        favs.append(recipe_id)
-        save_state(state)
+async def add_favorite(callback: CallbackQuery):
+    recipe_id = int(callback.data.split(":")[1])
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+    if recipe_id not in user["favorites"]:
+        user["favorites"].append(recipe_id)
+        save_data(data)
         await callback.answer("Добавлено в избранное ❤️")
     else:
         await callback.answer("Уже есть в избранном ❤️")
 
 
-@dp.callback_query(F.data == "clearfav")
-async def cb_clear_fav(callback: CallbackQuery):
-    state = load_state()
-    state["favorites"][user_id(callback)] = []
-    save_state(state)
-    await callback.message.answer("❤️ Избранное очищено.")
-    await callback.answer()
-
-
 @dp.callback_query(F.data.startswith("shop:"))
-async def cb_shop(callback: CallbackQuery):
-    recipe_id = callback.data.split(":", 1)[1]
-    recipe = find_recipe(recipe_id)
+async def add_shopping(callback: CallbackQuery):
+    recipe_id = int(callback.data.split(":")[1])
+    recipe = RECIPES_BY_ID.get(recipe_id)
     if not recipe:
         await callback.answer("Рецепт не найден", show_alert=True)
         return
-    state = load_state()
-    uid = user_id(callback)
-    shopping = state["shopping"].setdefault(uid, [])
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
     added = 0
     for item in recipe.get("ingredients", []):
-        if item not in shopping:
-            shopping.append(item)
+        if item not in user["shopping"]:
+            user["shopping"].append(item)
             added += 1
-    save_state(state)
+    save_data(data)
     await callback.answer(f"Добавлено продуктов: {added} 🛒")
 
 
-@dp.callback_query(F.data == "clearshop")
-async def cb_clear_shop(callback: CallbackQuery):
-    state = load_state()
-    state["shopping"][user_id(callback)] = []
-    save_state(state)
-    await callback.message.answer("🛒 Список продуктов очищен.")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("delshop:"))
-async def cb_del_shop(callback: CallbackQuery):
-    idx = int(callback.data.split(":", 1)[1])
-    state = load_state()
-    uid = user_id(callback)
-    items = state["shopping"].setdefault(uid, [])
-    if 0 <= idx < len(items):
-        removed = items.pop(idx)
-        save_state(state)
-        await callback.message.answer(f"Удалено: {removed}")
+@dp.callback_query(F.data.startswith("clear:"))
+async def clear_callback(callback: CallbackQuery):
+    kind = callback.data.split(":")[1]
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+    if kind == "favorites":
+        user["favorites"] = []
+        save_data(data)
+        await callback.message.edit_text("❤️ Избранное очищено.")
+    elif kind == "shopping":
+        user["shopping"] = []
+        save_data(data)
+        await callback.message.edit_text("🛒 Список продуктов очищен.")
     await callback.answer()
 
 
 @dp.message()
 async def fallback(message: Message):
-    await message.answer("Выбери раздел кнопками ниже 👇", reply_markup=main_keyboard)
+    await message.answer("Выбери раздел на клавиатуре 👇", reply_markup=main_keyboard())
 
 
 async def main():
-    logging.info("Bot started")
+    bot = Bot(BOT_TOKEN, parse_mode="HTML")
+    logger.info("Bot started. Recipes loaded: %s", len(RECIPES))
     await dp.start_polling(bot)
 
 
