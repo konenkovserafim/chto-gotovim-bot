@@ -37,25 +37,83 @@ CATEGORY_TITLES = {
 }
 TEXT_TO_CATEGORY = {v: k for k, v in CATEGORY_TITLES.items()}
 
-FRIDGE_PRODUCTS = [
-    {"code": "chicken", "title": "🐔 Курица", "aliases": ["куриц", "филе", "голень", "бедро"]},
-    {"code": "eggs", "title": "🥚 Яйца", "aliases": ["яйц", "омлет"]},
-    {"code": "cheese", "title": "🧀 Сыр", "aliases": ["сыр"]},
-    {"code": "cottage", "title": "🍚 Творог", "aliases": ["творог", "творож"]},
-    {"code": "milk", "title": "🥛 Молоко", "aliases": ["молоко"]},
-    {"code": "potato", "title": "🥔 Картофель", "aliases": ["картоф", "пюре"]},
-    {"code": "rice", "title": "🍚 Рис", "aliases": ["рис"]},
-    {"code": "buckwheat", "title": "🌾 Гречка", "aliases": ["греч"]},
-    {"code": "pasta", "title": "🍝 Макароны", "aliases": ["макарон", "паста", "спагетти"]},
-    {"code": "tomato", "title": "🍅 Помидоры", "aliases": ["помид", "томат"]},
-    {"code": "cucumber", "title": "🥒 Огурцы", "aliases": ["огур"]},
-    {"code": "onion", "title": "🧅 Лук", "aliases": ["лук"]},
-    {"code": "carrot", "title": "🥕 Морковь", "aliases": ["морков"]},
-    {"code": "fish", "title": "🐟 Рыба", "aliases": ["рыб", "минтай", "лосос", "треск"]},
-    {"code": "mince", "title": "🥩 Фарш", "aliases": ["фарш"]},
-    {"code": "bread", "title": "🍞 Хлеб", "aliases": ["хлеб", "тост", "лаваш"]},
-    {"code": "sourcream", "title": "🥣 Сметана", "aliases": ["сметан"]},
-]
+FRIDGE_CATEGORIES = {
+    "meat": {"title": "🥩 Мясо", "products": [
+        {"code": "chicken", "title": "🐔 Курица", "aliases": ["куриц", "филе", "голень", "бедро"]},
+        {"code": "turkey", "title": "🦃 Индейка", "aliases": ["индейк"]},
+        {"code": "beef", "title": "🥩 Говядина", "aliases": ["говядин", "говяж"]},
+        {"code": "pork", "title": "🥓 Свинина", "aliases": ["свинин", "свин"]},
+        {"code": "mince", "title": "🥩 Фарш", "aliases": ["фарш"]},
+        {"code": "sausage", "title": "🌭 Сосиски", "aliases": ["сосиск", "колбас"]},
+        {"code": "ham", "title": "🥓 Ветчина", "aliases": ["ветчин"]},
+    ]},
+    "fish": {"title": "🐟 Рыба и морепродукты", "products": [
+        {"code": "fish", "title": "🐟 Рыба", "aliases": ["рыб", "минтай", "треск", "хек"]},
+        {"code": "salmon", "title": "🍣 Красная рыба", "aliases": ["лосос", "семг", "форел", "красная рыба"]},
+        {"code": "tuna", "title": "🥫 Тунец", "aliases": ["тунец"]},
+        {"code": "shrimp", "title": "🦐 Креветки", "aliases": ["кревет"]},
+        {"code": "canned_fish", "title": "🥫 Рыбные консервы", "aliases": ["консервы", "сайра", "сардин"]},
+    ]},
+    "dairy": {"title": "🥚 Молочка и яйца", "products": [
+        {"code": "eggs", "title": "🥚 Яйца", "aliases": ["яйц", "омлет", "яичниц"]},
+        {"code": "cheese", "title": "🧀 Сыр", "aliases": ["сыр"]},
+        {"code": "cottage", "title": "🍚 Творог", "aliases": ["творог", "творож"]},
+        {"code": "milk", "title": "🥛 Молоко", "aliases": ["молоко"]},
+        {"code": "kefir", "title": "🥛 Кефир", "aliases": ["кефир"]},
+        {"code": "yogurt", "title": "🥛 Йогурт", "aliases": ["йогурт"]},
+        {"code": "sourcream", "title": "🥣 Сметана", "aliases": ["сметан"]},
+        {"code": "cream", "title": "🥛 Сливки", "aliases": ["сливк"]},
+        {"code": "butter", "title": "🧈 Сливочное масло", "aliases": ["сливочное масло", "масло слив"]},
+    ]},
+    "grains": {"title": "🌾 Крупы и гарниры", "products": [
+        {"code": "rice", "title": "🍚 Рис", "aliases": ["рис"]},
+        {"code": "buckwheat", "title": "🌾 Гречка", "aliases": ["греч"]},
+        {"code": "pasta", "title": "🍝 Макароны", "aliases": ["макарон", "паста", "спагетти", "лапша"]},
+        {"code": "oatmeal", "title": "🥣 Овсянка", "aliases": ["овсян", "хлопья"]},
+        {"code": "millet", "title": "🌾 Пшено", "aliases": ["пшено", "пшенн"]},
+        {"code": "semolina", "title": "🥣 Манка", "aliases": ["манк", "манная"]},
+        {"code": "bulgur", "title": "🌾 Булгур", "aliases": ["булгур"]},
+        {"code": "flour", "title": "🌾 Мука", "aliases": ["мука", "муки"]},
+        {"code": "bread", "title": "🍞 Хлеб/лаваш", "aliases": ["хлеб", "тост", "лаваш"]},
+    ]},
+    "vegetables": {"title": "🥬 Овощи", "products": [
+        {"code": "potato", "title": "🥔 Картофель", "aliases": ["картоф", "пюре"]},
+        {"code": "tomato", "title": "🍅 Помидоры", "aliases": ["помид", "томат"]},
+        {"code": "cucumber", "title": "🥒 Огурцы", "aliases": ["огур"]},
+        {"code": "onion", "title": "🧅 Лук", "aliases": ["лук", "луков"]},
+        {"code": "carrot", "title": "🥕 Морковь", "aliases": ["морков"]},
+        {"code": "cabbage", "title": "🥬 Капуста", "aliases": ["капуст"]},
+        {"code": "beet", "title": "🟣 Свёкла", "aliases": ["свек", "свёк"]},
+        {"code": "pepper", "title": "🫑 Перец", "aliases": ["перец", "болгар"]},
+        {"code": "zucchini", "title": "🥒 Кабачок", "aliases": ["кабач"]},
+        {"code": "eggplant", "title": "🍆 Баклажан", "aliases": ["баклаж"]},
+        {"code": "mushrooms", "title": "🍄 Грибы", "aliases": ["гриб", "шампин"]},
+        {"code": "broccoli", "title": "🥦 Брокколи", "aliases": ["брокк"]},
+        {"code": "garlic", "title": "🧄 Чеснок", "aliases": ["чеснок"]},
+        {"code": "greens", "title": "🌿 Зелень", "aliases": ["зелень", "укроп", "петруш", "кинз"]},
+    ]},
+    "fruits": {"title": "🍎 Фрукты и ягоды", "products": [
+        {"code": "apple", "title": "🍎 Яблоки", "aliases": ["яблок"]},
+        {"code": "banana", "title": "🍌 Бананы", "aliases": ["банан"]},
+        {"code": "orange", "title": "🍊 Апельсины", "aliases": ["апельсин"]},
+        {"code": "lemon", "title": "🍋 Лимон", "aliases": ["лимон"]},
+        {"code": "berries", "title": "🫐 Ягоды", "aliases": ["ягод", "клубник", "черник", "малин"]},
+        {"code": "pear", "title": "🍐 Груши", "aliases": ["груш"]},
+    ]},
+    "other": {"title": "🥫 Прочее", "products": [
+        {"code": "beans", "title": "🫘 Фасоль", "aliases": ["фасол"]},
+        {"code": "peas", "title": "🟢 Горошек", "aliases": ["горош"]},
+        {"code": "corn", "title": "🌽 Кукуруза", "aliases": ["кукуруз"]},
+        {"code": "tomato_paste", "title": "🥫 Томатная паста", "aliases": ["томатная паста"]},
+        {"code": "honey", "title": "🍯 Мёд", "aliases": ["мёд", "мед"]},
+        {"code": "nuts", "title": "🥜 Орехи", "aliases": ["орех"]},
+        {"code": "oil", "title": "🛢 Растительное масло", "aliases": ["растительное масло", "масло"]},
+        {"code": "soy_sauce", "title": "🥫 Соевый соус", "aliases": ["соевый"]},
+        {"code": "mayo", "title": "🥫 Майонез", "aliases": ["майонез"]},
+    ]},
+}
+
+FRIDGE_PRODUCTS = [product for group in FRIDGE_CATEGORIES.values() for product in group["products"]]
 FRIDGE_BY_CODE = {item["code"]: item for item in FRIDGE_PRODUCTS}
 
 
@@ -163,32 +221,54 @@ def clear_keyboard(kind: str) -> InlineKeyboardMarkup:
 
 
 
-def fridge_keyboard(selected_codes: list[str]) -> InlineKeyboardMarkup:
-    selected = set(selected_codes)
+def product_category_keyboard(selected_codes: list[str]) -> InlineKeyboardMarkup:
     rows = []
-    row = []
-    for product in FRIDGE_PRODUCTS:
-        mark = "✅ " if product["code"] in selected else ""
-        row.append(InlineKeyboardButton(text=f"{mark}{product['title']}", callback_data=f"fridge:toggle:{product['code']}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+    for key, group in FRIDGE_CATEGORIES.items():
+        rows.append([InlineKeyboardButton(text=group["title"], callback_data=f"fridge:category:{key}")])
     rows.append([InlineKeyboardButton(text="🔎 Найти блюда", callback_data="fridge:find")])
     rows.append([InlineKeyboardButton(text="🧹 Очистить холодильник", callback_data="fridge:clear")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def format_fridge(selected_codes: list[str]) -> str:
+def fridge_category_keyboard(category_key: str, selected_codes: list[str]) -> InlineKeyboardMarkup:
+    selected = set(selected_codes)
+    group = FRIDGE_CATEGORIES[category_key]
+    rows = []
+    row = []
+    for product in group["products"]:
+        mark = "✅ " if product["code"] in selected else ""
+        row.append(InlineKeyboardButton(text=f"{mark}{product['title']}", callback_data=f"fridge:toggle:{product['code']}:{category_key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ К разделам", callback_data="fridge:back")])
+    rows.append([InlineKeyboardButton(text="🔎 Найти блюда", callback_data="fridge:find")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_selected_products(selected_codes: list[str]) -> str:
     if not selected_codes:
-        selected_text = "пока ничего не выбрано"
-    else:
-        selected_text = ", ".join(FRIDGE_BY_CODE[code]["title"] for code in selected_codes if code in FRIDGE_BY_CODE)
+        return "пока ничего не выбрано"
+    titles = [FRIDGE_BY_CODE[code]["title"] for code in selected_codes if code in FRIDGE_BY_CODE]
+    return ", ".join(titles)
+
+
+def format_fridge(selected_codes: list[str]) -> str:
     return (
         "🥶 <b>Холодильник</b>\n\n"
-        "Отметь продукты, которые есть дома. Потом нажми <b>Найти блюда</b>.\n\n"
-        f"Сейчас выбрано: {selected_text}"
+        "Выбирай продукты по разделам. Потом нажми <b>Найти блюда</b>.\n\n"
+        f"Сейчас выбрано: {format_selected_products(selected_codes)}"
+    )
+
+
+def format_fridge_category(category_key: str, selected_codes: list[str]) -> str:
+    group = FRIDGE_CATEGORIES[category_key]
+    return (
+        f"🥶 <b>{group['title']}</b>\n\n"
+        "Отметь продукты, которые есть дома.\n\n"
+        f"Сейчас выбрано: {format_selected_products(selected_codes)}"
     )
 
 
@@ -197,29 +277,65 @@ def recipe_text_for_match(recipe: dict[str, Any]) -> str:
     return " ".join(parts).lower()
 
 
-def find_recipes_by_fridge(selected_codes: list[str]) -> list[tuple[dict[str, Any], int]]:
-    if not selected_codes:
-        return []
-    selected_products = [FRIDGE_BY_CODE[code] for code in selected_codes if code in FRIDGE_BY_CODE]
-    results = []
+def detected_product_codes(recipe: dict[str, Any]) -> set[str]:
+    text = recipe_text_for_match(recipe)
+    found = set()
+    for product in FRIDGE_PRODUCTS:
+        if any(alias in text for alias in product["aliases"]):
+            found.add(product["code"])
+    return found
+
+
+def find_recipes_by_fridge(selected_codes: list[str]) -> dict[str, list[tuple[dict[str, Any], set[str], set[str]]]]:
+    selected = set(selected_codes)
+    results = {"full": [], "almost": []}
+    if not selected:
+        return results
+
     for recipe in RECIPES:
-        text = recipe_text_for_match(recipe)
-        score = 0
-        for product in selected_products:
-            if any(alias in text for alias in product["aliases"]):
-                score += 1
-        if score > 0:
-            results.append((recipe, score))
-    results.sort(key=lambda pair: (pair[1], -int(pair[0].get("time", 999))), reverse=True)
+        required = detected_product_codes(recipe)
+        if not required:
+            continue
+        matched = required & selected
+        missing = required - selected
+
+        if not matched:
+            continue
+
+        if not missing:
+            results["full"].append((recipe, matched, missing))
+        elif len(missing) <= 2:
+            results["almost"].append((recipe, matched, missing))
+
+    results["full"].sort(key=lambda item: (-len(item[1]), int(item[0].get("time", 999))))
+    results["almost"].sort(key=lambda item: (len(item[2]), -len(item[1]), int(item[0].get("time", 999))))
     return results
 
 
-def fridge_results_keyboard(results: list[tuple[dict[str, Any], int]], selected_codes: list[str]) -> InlineKeyboardMarkup:
+def fridge_results_keyboard(results: dict[str, list[tuple[dict[str, Any], set[str], set[str]]]]) -> InlineKeyboardMarkup:
     rows = []
-    for recipe, score in results[:12]:
-        rows.append([InlineKeyboardButton(text=f"{recipe['name']} · совпадений: {score}", callback_data=f"recipe:{recipe['id']}:{recipe.get('category', 'lunch')}:0")])
+    shown = 0
+    for recipe, matched, missing in results["full"][:8]:
+        rows.append([InlineKeyboardButton(text=f"✅ {recipe['name']}", callback_data=f"recipe:{recipe['id']}:{recipe.get('category', 'lunch')}:0")])
+        shown += 1
+    for recipe, matched, missing in results["almost"][:8]:
+        missing_titles = ", ".join(FRIDGE_BY_CODE[c]["title"] for c in missing if c in FRIDGE_BY_CODE)
+        rows.append([InlineKeyboardButton(text=f"🟡 {recipe['name']} · не хватает: {missing_titles}", callback_data=f"recipe:{recipe['id']}:{recipe.get('category', 'lunch')}:0")])
+        shown += 1
     rows.append([InlineKeyboardButton(text="⬅️ К холодильнику", callback_data="fridge:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_fridge_results(selected_codes: list[str], results: dict[str, list[tuple[dict[str, Any], set[str], set[str]]]]) -> str:
+    full_count = len(results["full"])
+    almost_count = len(results["almost"])
+    return (
+        "🥶 <b>Что можно приготовить?</b>\n\n"
+        f"Выбрано: {format_selected_products(selected_codes)}\n\n"
+        f"✅ Полностью подходит: <b>{full_count}</b>\n"
+        f"🟡 Почти подходит, не хватает 1–2 продукта: <b>{almost_count}</b>\n\n"
+        "Ниже — самые подходящие варианты."
+    )
 
 
 def format_recipe(r: dict[str, Any]) -> str:
@@ -306,7 +422,7 @@ async def fridge_message(message: Message):
     data = load_data()
     user = get_user(data, message.from_user.id)
     selected = user.get("fridge", [])
-    await message.answer(format_fridge(selected), reply_markup=fridge_keyboard(selected), parse_mode="HTML")
+    await message.answer(format_fridge(selected), reply_markup=product_category_keyboard(selected), parse_mode="HTML")
 
 
 
@@ -319,50 +435,66 @@ async def fridge_callback(callback: CallbackQuery):
     user = get_user(data, callback.from_user.id)
     selected = user.get("fridge", [])
 
+    if action == "category":
+        category_key = parts[2]
+        if category_key not in FRIDGE_CATEGORIES:
+            await callback.answer("Раздел не найден", show_alert=True)
+            return
+        await callback.message.edit_text(
+            format_fridge_category(category_key, selected),
+            reply_markup=fridge_category_keyboard(category_key, selected),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
     if action == "toggle":
         code = parts[2]
+        category_key = parts[3] if len(parts) > 3 else "meat"
         if code in selected:
             selected.remove(code)
         else:
             selected.append(code)
         user["fridge"] = selected
         save_data(data)
-        await callback.message.edit_text(format_fridge(selected), reply_markup=fridge_keyboard(selected), parse_mode="HTML")
+        await callback.message.edit_text(
+            format_fridge_category(category_key, selected),
+            reply_markup=fridge_category_keyboard(category_key, selected),
+            parse_mode="HTML",
+        )
         await callback.answer()
         return
 
     if action == "clear":
         user["fridge"] = []
         save_data(data)
-        await callback.message.edit_text(format_fridge([]), reply_markup=fridge_keyboard([]), parse_mode="HTML")
+        await callback.message.edit_text(format_fridge([]), reply_markup=product_category_keyboard([]), parse_mode="HTML")
         await callback.answer("Холодильник очищен")
         return
 
     if action == "back":
-        await callback.message.edit_text(format_fridge(selected), reply_markup=fridge_keyboard(selected), parse_mode="HTML")
+        await callback.message.edit_text(format_fridge(selected), reply_markup=product_category_keyboard(selected), parse_mode="HTML")
         await callback.answer()
         return
 
     if action == "find":
-        results = find_recipes_by_fridge(selected)
         if not selected:
             await callback.answer("Сначала выбери продукты", show_alert=True)
             return
-        if not results:
+        results = find_recipes_by_fridge(selected)
+        if not results["full"] and not results["almost"]:
             await callback.message.edit_text(
                 "🥶 <b>Холодильник</b>\n\nПо выбранным продуктам ничего не нашёл. Попробуй выбрать больше продуктов.",
-                reply_markup=fridge_keyboard(selected),
+                reply_markup=product_category_keyboard(selected),
                 parse_mode="HTML",
             )
             await callback.answer()
             return
-        selected_text = ", ".join(FRIDGE_BY_CODE[code]["title"] for code in selected if code in FRIDGE_BY_CODE)
-        text = (
-            "🥶 <b>Что можно приготовить?</b>\n\n"
-            f"Выбрано: {selected_text}\n\n"
-            f"Нашёл вариантов: <b>{len(results)}</b>. Показываю самые подходящие:"
+        await callback.message.edit_text(
+            format_fridge_results(selected, results),
+            reply_markup=fridge_results_keyboard(results),
+            parse_mode="HTML",
         )
-        await callback.message.edit_text(text, reply_markup=fridge_results_keyboard(results, selected), parse_mode="HTML")
         await callback.answer()
         return
 
