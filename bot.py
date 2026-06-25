@@ -37,6 +37,27 @@ CATEGORY_TITLES = {
 }
 TEXT_TO_CATEGORY = {v: k for k, v in CATEGORY_TITLES.items()}
 
+FRIDGE_PRODUCTS = [
+    {"code": "chicken", "title": "🐔 Курица", "aliases": ["куриц", "филе", "голень", "бедро"]},
+    {"code": "eggs", "title": "🥚 Яйца", "aliases": ["яйц", "омлет"]},
+    {"code": "cheese", "title": "🧀 Сыр", "aliases": ["сыр"]},
+    {"code": "cottage", "title": "🍚 Творог", "aliases": ["творог", "творож"]},
+    {"code": "milk", "title": "🥛 Молоко", "aliases": ["молоко"]},
+    {"code": "potato", "title": "🥔 Картофель", "aliases": ["картоф", "пюре"]},
+    {"code": "rice", "title": "🍚 Рис", "aliases": ["рис"]},
+    {"code": "buckwheat", "title": "🌾 Гречка", "aliases": ["греч"]},
+    {"code": "pasta", "title": "🍝 Макароны", "aliases": ["макарон", "паста", "спагетти"]},
+    {"code": "tomato", "title": "🍅 Помидоры", "aliases": ["помид", "томат"]},
+    {"code": "cucumber", "title": "🥒 Огурцы", "aliases": ["огур"]},
+    {"code": "onion", "title": "🧅 Лук", "aliases": ["лук"]},
+    {"code": "carrot", "title": "🥕 Морковь", "aliases": ["морков"]},
+    {"code": "fish", "title": "🐟 Рыба", "aliases": ["рыб", "минтай", "лосос", "треск"]},
+    {"code": "mince", "title": "🥩 Фарш", "aliases": ["фарш"]},
+    {"code": "bread", "title": "🍞 Хлеб", "aliases": ["хлеб", "тост", "лаваш"]},
+    {"code": "sourcream", "title": "🥣 Сметана", "aliases": ["сметан"]},
+]
+FRIDGE_BY_CODE = {item["code"]: item for item in FRIDGE_PRODUCTS}
+
 
 def load_recipes() -> list[dict[str, Any]]:
     with RECIPES_PATH.open("r", encoding="utf-8") as f:
@@ -66,9 +87,10 @@ def save_data(data: dict[str, Any]) -> None:
 def get_user(data: dict[str, Any], user_id: int) -> dict[str, Any]:
     key = str(user_id)
     if key not in data:
-        data[key] = {"favorites": [], "shopping": []}
+        data[key] = {"favorites": [], "shopping": [], "fridge": []}
     data[key].setdefault("favorites", [])
     data[key].setdefault("shopping", [])
+    data[key].setdefault("fridge", [])
     return data[key]
 
 
@@ -79,6 +101,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
             [KeyboardButton(text="🎲 Что приготовить?")],
             [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="🛒 Список продуктов")],
+            [KeyboardButton(text="🥶 Холодильник")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери раздел",
@@ -136,6 +159,67 @@ def clear_keyboard(kind: str) -> InlineKeyboardMarkup:
     if kind == "favorites":
         return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")]])
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear:shopping")]])
+
+
+
+
+def fridge_keyboard(selected_codes: list[str]) -> InlineKeyboardMarkup:
+    selected = set(selected_codes)
+    rows = []
+    row = []
+    for product in FRIDGE_PRODUCTS:
+        mark = "✅ " if product["code"] in selected else ""
+        row.append(InlineKeyboardButton(text=f"{mark}{product['title']}", callback_data=f"fridge:toggle:{product['code']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="🔎 Найти блюда", callback_data="fridge:find")])
+    rows.append([InlineKeyboardButton(text="🧹 Очистить холодильник", callback_data="fridge:clear")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_fridge(selected_codes: list[str]) -> str:
+    if not selected_codes:
+        selected_text = "пока ничего не выбрано"
+    else:
+        selected_text = ", ".join(FRIDGE_BY_CODE[code]["title"] for code in selected_codes if code in FRIDGE_BY_CODE)
+    return (
+        "🥶 <b>Холодильник</b>\n\n"
+        "Отметь продукты, которые есть дома. Потом нажми <b>Найти блюда</b>.\n\n"
+        f"Сейчас выбрано: {selected_text}"
+    )
+
+
+def recipe_text_for_match(recipe: dict[str, Any]) -> str:
+    parts = [recipe.get("name", ""), " ".join(recipe.get("ingredients", [])), " ".join(recipe.get("tags", []))]
+    return " ".join(parts).lower()
+
+
+def find_recipes_by_fridge(selected_codes: list[str]) -> list[tuple[dict[str, Any], int]]:
+    if not selected_codes:
+        return []
+    selected_products = [FRIDGE_BY_CODE[code] for code in selected_codes if code in FRIDGE_BY_CODE]
+    results = []
+    for recipe in RECIPES:
+        text = recipe_text_for_match(recipe)
+        score = 0
+        for product in selected_products:
+            if any(alias in text for alias in product["aliases"]):
+                score += 1
+        if score > 0:
+            results.append((recipe, score))
+    results.sort(key=lambda pair: (pair[1], -int(pair[0].get("time", 999))), reverse=True)
+    return results
+
+
+def fridge_results_keyboard(results: list[tuple[dict[str, Any], int]], selected_codes: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for recipe, score in results[:12]:
+        rows.append([InlineKeyboardButton(text=f"{recipe['name']} · совпадений: {score}", callback_data=f"recipe:{recipe['id']}:{recipe.get('category', 'lunch')}:0")])
+    rows.append([InlineKeyboardButton(text="⬅️ К холодильнику", callback_data="fridge:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def format_recipe(r: dict[str, Any]) -> str:
@@ -213,6 +297,74 @@ async def shopping_message(message: Message):
     for item in items:
         lines.append(f"• {item}")
     await message.answer("\n".join(lines), reply_markup=clear_keyboard("shopping"), parse_mode="HTML")
+
+
+
+
+@dp.message(F.text == "🥶 Холодильник")
+async def fridge_message(message: Message):
+    data = load_data()
+    user = get_user(data, message.from_user.id)
+    selected = user.get("fridge", [])
+    await message.answer(format_fridge(selected), reply_markup=fridge_keyboard(selected), parse_mode="HTML")
+
+
+
+
+@dp.callback_query(F.data.startswith("fridge:"))
+async def fridge_callback(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    action = parts[1]
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+    selected = user.get("fridge", [])
+
+    if action == "toggle":
+        code = parts[2]
+        if code in selected:
+            selected.remove(code)
+        else:
+            selected.append(code)
+        user["fridge"] = selected
+        save_data(data)
+        await callback.message.edit_text(format_fridge(selected), reply_markup=fridge_keyboard(selected), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if action == "clear":
+        user["fridge"] = []
+        save_data(data)
+        await callback.message.edit_text(format_fridge([]), reply_markup=fridge_keyboard([]), parse_mode="HTML")
+        await callback.answer("Холодильник очищен")
+        return
+
+    if action == "back":
+        await callback.message.edit_text(format_fridge(selected), reply_markup=fridge_keyboard(selected), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if action == "find":
+        results = find_recipes_by_fridge(selected)
+        if not selected:
+            await callback.answer("Сначала выбери продукты", show_alert=True)
+            return
+        if not results:
+            await callback.message.edit_text(
+                "🥶 <b>Холодильник</b>\n\nПо выбранным продуктам ничего не нашёл. Попробуй выбрать больше продуктов.",
+                reply_markup=fridge_keyboard(selected),
+                parse_mode="HTML",
+            )
+            await callback.answer()
+            return
+        selected_text = ", ".join(FRIDGE_BY_CODE[code]["title"] for code in selected if code in FRIDGE_BY_CODE)
+        text = (
+            "🥶 <b>Что можно приготовить?</b>\n\n"
+            f"Выбрано: {selected_text}\n\n"
+            f"Нашёл вариантов: <b>{len(results)}</b>. Показываю самые подходящие:"
+        )
+        await callback.message.edit_text(text, reply_markup=fridge_results_keyboard(results, selected), parse_mode="HTML")
+        await callback.answer()
+        return
 
 
 @dp.callback_query(F.data.startswith("favrecipe:"))
