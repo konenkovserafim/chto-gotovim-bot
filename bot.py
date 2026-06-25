@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Add it in Railway Variables.")
 
 RECIPES_PATH = Path("recipes.json")
-DATA_PATH = Path("user_data.json")
+DB_PATH = Path("bot_data.db")
 PAGE_SIZE = 8
 
 CATEGORY_TITLES = {
@@ -117,40 +118,170 @@ FRIDGE_PRODUCTS = [product for group in FRIDGE_CATEGORIES.values() for product i
 FRIDGE_BY_CODE = {item["code"]: item for item in FRIDGE_PRODUCTS}
 
 
-def load_recipes() -> list[dict[str, Any]]:
+
+def load_recipes_from_json() -> list[dict[str, Any]]:
     with RECIPES_PATH.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
-RECIPES = load_recipes()
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    recipes = load_recipes_from_json()
+    with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS recipes (
+                id INTEGER PRIMARY KEY,
+                category TEXT NOT NULL,
+                name TEXT NOT NULL,
+                time INTEGER,
+                difficulty TEXT,
+                price INTEGER,
+                calories INTEGER,
+                ingredients_json TEXT NOT NULL,
+                steps_json TEXT NOT NULL,
+                tags_json TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id INTEGER NOT NULL,
+                recipe_id INTEGER NOT NULL,
+                PRIMARY KEY (user_id, recipe_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shopping_items (
+                user_id INTEGER NOT NULL,
+                item TEXT NOT NULL,
+                PRIMARY KEY (user_id, item)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fridge_items (
+                user_id INTEGER NOT NULL,
+                product_code TEXT NOT NULL,
+                PRIMARY KEY (user_id, product_code)
+            )
+        """)
+        for recipe in recipes:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO recipes
+                (id, category, name, time, difficulty, price, calories, ingredients_json, steps_json, tags_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(recipe["id"]),
+                    recipe.get("category", "lunch"),
+                    recipe.get("name", "Без названия"),
+                    int(recipe.get("time", 0) or 0),
+                    recipe.get("difficulty", "Легко"),
+                    int(recipe.get("price", 0) or 0),
+                    int(recipe.get("calories", 0) or 0),
+                    json.dumps(recipe.get("ingredients", []), ensure_ascii=False),
+                    json.dumps(recipe.get("steps", []), ensure_ascii=False),
+                    json.dumps(recipe.get("tags", []), ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+
+
+def row_to_recipe(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "category": row["category"],
+        "name": row["name"],
+        "time": row["time"],
+        "difficulty": row["difficulty"],
+        "price": row["price"],
+        "calories": row["calories"],
+        "ingredients": json.loads(row["ingredients_json"]),
+        "steps": json.loads(row["steps_json"]),
+        "tags": json.loads(row["tags_json"]),
+    }
+
+
+def get_all_recipes() -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT * FROM recipes ORDER BY id").fetchall()
+    return [row_to_recipe(row) for row in rows]
+
+
+def get_recipe_by_id(recipe_id: int) -> dict[str, Any] | None:
+    with db_connect() as conn:
+        row = conn.execute("SELECT * FROM recipes WHERE id = ?", (recipe_id,)).fetchone()
+    return row_to_recipe(row) if row else None
+
+
+def get_favorites(user_id: int) -> list[int]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT recipe_id FROM favorites WHERE user_id = ? ORDER BY recipe_id", (user_id,)).fetchall()
+    return [int(row["recipe_id"]) for row in rows]
+
+
+def add_favorite_db(user_id: int, recipe_id: int) -> bool:
+    with db_connect() as conn:
+        cur = conn.execute("INSERT OR IGNORE INTO favorites (user_id, recipe_id) VALUES (?, ?)", (user_id, recipe_id))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def clear_favorites_db(user_id: int) -> None:
+    with db_connect() as conn:
+        conn.execute("DELETE FROM favorites WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def get_shopping_items(user_id: int) -> list[str]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT item FROM shopping_items WHERE user_id = ? ORDER BY item", (user_id,)).fetchall()
+    return [row["item"] for row in rows]
+
+
+def add_shopping_item_db(user_id: int, item: str) -> bool:
+    with db_connect() as conn:
+        cur = conn.execute("INSERT OR IGNORE INTO shopping_items (user_id, item) VALUES (?, ?)", (user_id, item))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def clear_shopping_db(user_id: int) -> None:
+    with db_connect() as conn:
+        conn.execute("DELETE FROM shopping_items WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def get_fridge_items(user_id: int) -> list[str]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT product_code FROM fridge_items WHERE user_id = ? ORDER BY product_code", (user_id,)).fetchall()
+    return [row["product_code"] for row in rows]
+
+
+def toggle_fridge_item_db(user_id: int, product_code: str) -> list[str]:
+    selected = set(get_fridge_items(user_id))
+    with db_connect() as conn:
+        if product_code in selected:
+            conn.execute("DELETE FROM fridge_items WHERE user_id = ? AND product_code = ?", (user_id, product_code))
+        else:
+            conn.execute("INSERT OR IGNORE INTO fridge_items (user_id, product_code) VALUES (?, ?)", (user_id, product_code))
+        conn.commit()
+    return get_fridge_items(user_id)
+
+
+def clear_fridge_db(user_id: int) -> None:
+    with db_connect() as conn:
+        conn.execute("DELETE FROM fridge_items WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+init_db()
+RECIPES = get_all_recipes()
 RECIPES_BY_ID = {int(r["id"]): r for r in RECIPES}
-
-
-def load_data() -> dict[str, Any]:
-    if not DATA_PATH.exists():
-        return {}
-    try:
-        with DATA_PATH.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        logger.exception("Failed to load user_data.json")
-        return {}
-
-
-def save_data(data: dict[str, Any]) -> None:
-    with DATA_PATH.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def get_user(data: dict[str, Any], user_id: int) -> dict[str, Any]:
-    key = str(user_id)
-    if key not in data:
-        data[key] = {"favorites": [], "shopping": [], "fridge": []}
-    data[key].setdefault("favorites", [])
-    data[key].setdefault("shopping", [])
-    data[key].setdefault("fridge", [])
-    return data[key]
-
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -388,9 +519,7 @@ async def random_recipe_message(message: Message):
 
 @dp.message(F.text == "❤️ Избранное")
 async def favorites_message(message: Message):
-    data = load_data()
-    user = get_user(data, message.from_user.id)
-    fav_ids = [int(x) for x in user.get("favorites", []) if int(x) in RECIPES_BY_ID]
+    fav_ids = [x for x in get_favorites(message.from_user.id) if x in RECIPES_BY_ID]
     if not fav_ids:
         await message.answer("❤️ В избранном пока пусто.")
         return
@@ -403,9 +532,7 @@ async def favorites_message(message: Message):
 
 @dp.message(F.text == "🛒 Список продуктов")
 async def shopping_message(message: Message):
-    data = load_data()
-    user = get_user(data, message.from_user.id)
-    items = user.get("shopping", [])
+    items = get_shopping_items(message.from_user.id)
     if not items:
         await message.answer("🛒 Список продуктов пока пуст.")
         return
@@ -419,9 +546,7 @@ async def shopping_message(message: Message):
 
 @dp.message(F.text == "🥶 Холодильник")
 async def fridge_message(message: Message):
-    data = load_data()
-    user = get_user(data, message.from_user.id)
-    selected = user.get("fridge", [])
+    selected = get_fridge_items(message.from_user.id)
     await message.answer(format_fridge(selected), reply_markup=product_category_keyboard(selected), parse_mode="HTML")
 
 
@@ -431,9 +556,7 @@ async def fridge_message(message: Message):
 async def fridge_callback(callback: CallbackQuery):
     parts = callback.data.split(":")
     action = parts[1]
-    data = load_data()
-    user = get_user(data, callback.from_user.id)
-    selected = user.get("fridge", [])
+    selected = get_fridge_items(callback.from_user.id)
 
     if action == "category":
         category_key = parts[2]
@@ -451,12 +574,7 @@ async def fridge_callback(callback: CallbackQuery):
     if action == "toggle":
         code = parts[2]
         category_key = parts[3] if len(parts) > 3 else "meat"
-        if code in selected:
-            selected.remove(code)
-        else:
-            selected.append(code)
-        user["fridge"] = selected
-        save_data(data)
+        selected = toggle_fridge_item_db(callback.from_user.id, code)
         await callback.message.edit_text(
             format_fridge_category(category_key, selected),
             reply_markup=fridge_category_keyboard(category_key, selected),
@@ -466,8 +584,7 @@ async def fridge_callback(callback: CallbackQuery):
         return
 
     if action == "clear":
-        user["fridge"] = []
-        save_data(data)
+        clear_fridge_db(callback.from_user.id)
         await callback.message.edit_text(format_fridge([]), reply_markup=product_category_keyboard([]), parse_mode="HTML")
         await callback.answer("Холодильник очищен")
         return
@@ -554,11 +671,7 @@ async def random_category_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("fav:"))
 async def add_favorite(callback: CallbackQuery):
     recipe_id = int(callback.data.split(":")[1])
-    data = load_data()
-    user = get_user(data, callback.from_user.id)
-    if recipe_id not in user["favorites"]:
-        user["favorites"].append(recipe_id)
-        save_data(data)
+    if add_favorite_db(callback.from_user.id, recipe_id):
         await callback.answer("Добавлено в избранное ❤️")
     else:
         await callback.answer("Уже есть в избранном ❤️")
@@ -571,29 +684,21 @@ async def add_shopping(callback: CallbackQuery):
     if not recipe:
         await callback.answer("Рецепт не найден", show_alert=True)
         return
-    data = load_data()
-    user = get_user(data, callback.from_user.id)
     added = 0
     for item in recipe.get("ingredients", []):
-        if item not in user["shopping"]:
-            user["shopping"].append(item)
+        if add_shopping_item_db(callback.from_user.id, item):
             added += 1
-    save_data(data)
     await callback.answer(f"Добавлено продуктов: {added} 🛒")
 
 
 @dp.callback_query(F.data.startswith("clear:"))
 async def clear_callback(callback: CallbackQuery):
     kind = callback.data.split(":")[1]
-    data = load_data()
-    user = get_user(data, callback.from_user.id)
     if kind == "favorites":
-        user["favorites"] = []
-        save_data(data)
+        clear_favorites_db(callback.from_user.id)
         await callback.message.edit_text("❤️ Избранное очищено.")
     elif kind == "shopping":
-        user["shopping"] = []
-        save_data(data)
+        clear_shopping_db(callback.from_user.id)
         await callback.message.edit_text("🛒 Список продуктов очищен.")
     await callback.answer()
 
