@@ -288,7 +288,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🍳 Завтрак"), KeyboardButton(text="🍲 Обед")],
             [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
-            [KeyboardButton(text="🎲 Что приготовить?")],
+            [KeyboardButton(text="🎲 Что приготовить?"), KeyboardButton(text="🔍 Поиск")],
             [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="🛒 Список продуктов")],
             [KeyboardButton(text="🥶 Холодильник")],
         ],
@@ -469,6 +469,86 @@ def format_fridge_results(selected_codes: list[str], results: dict[str, list[tup
     )
 
 
+
+SEARCH_WAITING: set[int] = set()
+
+
+def normalize_text(value: str) -> str:
+    return (value or "").lower().replace("ё", "е").strip()
+
+
+def recipe_search_text(recipe: dict[str, Any]) -> str:
+    parts = [
+        recipe.get("name", ""),
+        " ".join(recipe.get("ingredients", [])),
+        " ".join(recipe.get("steps", [])),
+        " ".join(recipe.get("tags", [])),
+        recipe.get("category", ""),
+    ]
+    return normalize_text(" ".join(parts))
+
+
+def search_recipes(query: str) -> list[dict[str, Any]]:
+    q = normalize_text(query)
+    if len(q) < 2:
+        return []
+    words = [w for w in q.split() if len(w) >= 2]
+    results = []
+    for recipe in RECIPES:
+        text = recipe_search_text(recipe)
+        name = normalize_text(recipe.get("name", ""))
+        tags = normalize_text(" ".join(recipe.get("tags", [])))
+        if q in text or all(word in text for word in words):
+            score = 0
+            if q in name:
+                score += 100
+            if q in tags:
+                score += 50
+            score += sum(10 for word in words if word in name)
+            score += sum(5 for word in words if word in tags)
+            results.append((score, recipe))
+    results.sort(key=lambda item: (-item[0], int(item[1].get("time", 999)), item[1].get("name", "")))
+    return [recipe for score, recipe in results]
+
+
+def search_results_keyboard(query: str, page: int = 0) -> InlineKeyboardMarkup:
+    results = search_recipes(query)
+    start = page * PAGE_SIZE
+    chunk = results[start:start + PAGE_SIZE]
+    rows = [
+        [InlineKeyboardButton(text=recipe["name"], callback_data=f"searchrecipe:{recipe['id']}:{page}")]
+        for recipe in chunk
+    ]
+    nav = []
+    safe_query = query[:50]
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"searchpage:{page-1}:{safe_query}"))
+    if start + PAGE_SIZE < len(results):
+        nav.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"searchpage:{page+1}:{safe_query}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search:new")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_search_results(query: str, page: int = 0) -> str:
+    results = search_recipes(query)
+    pages = max(1, (len(results) + PAGE_SIZE - 1) // PAGE_SIZE)
+    if not results:
+        return (
+            f"🔍 <b>Поиск</b>\n\n"
+            f"По запросу <b>{query}</b> ничего не нашёл.\n\n"
+            "Попробуй написать проще: например, <b>курица</b>, <b>рис</b>, <b>сыр</b>, <b>суп</b>."
+        )
+    return (
+        f"🔍 <b>Результаты поиска</b>\n\n"
+        f"Запрос: <b>{query}</b>\n"
+        f"Найдено рецептов: <b>{len(results)}</b>\n"
+        f"Страница {page + 1}/{pages}.\n\n"
+        "Выбери блюдо."
+    )
+
+
 def format_recipe(r: dict[str, Any]) -> str:
     ingredients = "\n".join(f"• {item}" for item in r.get("ingredients", []))
     steps = "\n".join(f"{i}. {step}" for i, step in enumerate(r.get("steps", []), 1))
@@ -515,6 +595,21 @@ async def category_from_keyboard(message: Message):
 async def random_recipe_message(message: Message):
     recipe = random.choice(RECIPES)
     await message.answer(format_recipe(recipe), reply_markup=recipe_actions_keyboard(recipe["id"], recipe.get("category")), parse_mode="HTML")
+
+
+@dp.message(F.text == "🔍 Поиск")
+async def search_message(message: Message):
+    SEARCH_WAITING.add(message.from_user.id)
+    await message.answer(
+        "🔍 <b>Поиск блюда</b>\n\n"
+        "Напиши, что искать. Например:\n"
+        "• курица\n"
+        "• рис\n"
+        "• сыр\n"
+        "• суп\n"
+        "• творог",
+        parse_mode="HTML",
+    )
 
 
 @dp.message(F.text == "❤️ Избранное")
@@ -616,6 +711,44 @@ async def fridge_callback(callback: CallbackQuery):
         return
 
 
+@dp.callback_query(F.data == "search:new")
+async def search_new_callback(callback: CallbackQuery):
+    SEARCH_WAITING.add(callback.from_user.id)
+    await callback.message.edit_text(
+        "🔍 <b>Новый поиск</b>\n\nНапиши, что искать. Например: <b>курица</b> или <b>рис</b>.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("searchpage:"))
+async def search_page_callback(callback: CallbackQuery):
+    _, page_s, query = callback.data.split(":", 2)
+    page = int(page_s)
+    await callback.message.edit_text(
+        format_search_results(query, page),
+        reply_markup=search_results_keyboard(query, page),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("searchrecipe:"))
+async def search_recipe_callback(callback: CallbackQuery):
+    _, recipe_id_s, page_s = callback.data.split(":")
+    recipe_id = int(recipe_id_s)
+    recipe = RECIPES_BY_ID.get(recipe_id)
+    if not recipe:
+        await callback.answer("Рецепт не найден", show_alert=True)
+        return
+    await callback.message.edit_text(
+        format_recipe(recipe),
+        reply_markup=recipe_actions_keyboard(recipe_id, recipe.get("category"), 0),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("favrecipe:"))
 async def favorite_recipe_callback(callback: CallbackQuery):
     recipe_id = int(callback.data.split(":")[1])
@@ -705,6 +838,15 @@ async def clear_callback(callback: CallbackQuery):
 
 @dp.message()
 async def fallback(message: Message):
+    if message.from_user.id in SEARCH_WAITING and message.text:
+        query = message.text.strip()
+        SEARCH_WAITING.discard(message.from_user.id)
+        await message.answer(
+            format_search_results(query, 0),
+            reply_markup=search_results_keyboard(query, 0),
+            parse_mode="HTML",
+        )
+        return
     await message.answer("Выбери раздел на клавиатуре 👇", reply_markup=main_keyboard())
 
 
