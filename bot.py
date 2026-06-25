@@ -4,7 +4,9 @@ import logging
 import os
 import random
 import sqlite3
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F
@@ -344,7 +346,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🍳 Завтрак"), KeyboardButton(text="🍲 Обед")],
             [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
-            [KeyboardButton(text="🎲 Что приготовить?"), KeyboardButton(text="🔍 Поиск")],
+            [KeyboardButton(text="🎲 Подобрать блюдо"), KeyboardButton(text="🔍 Поиск")],
             [KeyboardButton(text="⚙️ Фильтры"), KeyboardButton(text="❤️ Избранное")],
             [KeyboardButton(text="🛒 Список продуктов"), KeyboardButton(text="🥶 Холодильник")],
             [KeyboardButton(text="👥 Профили")],
@@ -769,17 +771,121 @@ def format_category(category: str, page: int = 0) -> str:
     return f"{CATEGORY_TITLES[category]}\n\nВыбери блюдо.\nСтраница {page + 1}/{pages}. Всего рецептов: {total}."
 
 
+def current_hour() -> int:
+    tz_name = os.getenv("BOT_TIMEZONE", "Europe/Moscow")
+    try:
+        return datetime.now(ZoneInfo(tz_name)).hour
+    except Exception:
+        return datetime.now().hour
+
+
+def current_meal_category() -> str:
+    hour = current_hour()
+    if 5 <= hour < 11:
+        return "breakfast"
+    if 11 <= hour < 17:
+        return "lunch"
+    return "dinner"
+
+
+def format_home_text() -> str:
+    category = current_meal_category()
+    if category == "breakfast":
+        return "☀️ <b>Доброе утро!</b>\n\nЧем позавтракаем?"
+    if category == "lunch":
+        return "🍲 <b>Пора подумать об обеде.</b>"
+    return "🌙 <b>Что приготовим на ужин?</b>"
+
+
+def home_keyboard() -> InlineKeyboardMarkup:
+    category = current_meal_category()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✨ Подобрать блюдо", callback_data="recommend:now")],
+            [InlineKeyboardButton(text=CATEGORY_TITLES[category], callback_data=f"cat:{category}:0")],
+        ]
+    )
+
+
+def recommend_recipe(user_id: int) -> tuple[dict[str, Any], list[str]]:
+    target_category = current_meal_category()
+    selected = set(get_fridge_items(user_id))
+    favorites = set(get_favorites(user_id))
+    candidates = recipes_for_category(target_category) or RECIPES
+
+    scored = []
+    for recipe in candidates:
+        score = 0
+        reasons = []
+
+        required = detected_product_codes(recipe)
+        matched = required & selected
+        missing = required - selected
+
+        if selected and required:
+            if not missing:
+                score += 50
+                reasons.append("✅ Все продукты уже есть в холодильнике.")
+            elif matched and len(missing) <= 2:
+                score += 25 - len(missing) * 5
+                missing_titles = ", ".join(FRIDGE_BY_CODE[c]["title"] for c in missing if c in FRIDGE_BY_CODE)
+                if missing_titles:
+                    reasons.append(f"🛒 Не хватает только: {missing_titles}.")
+            elif matched:
+                score += 10
+
+        if int(recipe.get("id", 0)) in favorites:
+            score += 20
+            reasons.append("❤️ Это блюдо есть в избранном.")
+
+        time = int(recipe.get("time", 0) or 0)
+        if time and time <= 30:
+            score += 10
+            reasons.append(f"⏱️ Готовится за {time} минут.")
+        elif time:
+            reasons.append(f"⏱️ Время приготовления: {time} минут.")
+
+        if not reasons:
+            reasons.append("🍽 Подходит под текущее время дня.")
+
+        scored.append((score, random.random(), recipe, reasons))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    _, _, recipe, reasons = scored[0]
+    return recipe, reasons[:3]
+
+
+def format_recommendation(recipe: dict[str, Any], reasons: list[str]) -> str:
+    lines = [
+        f"🍽 <b>Сегодня предлагаю «{recipe['name']}»</b>",
+        "",
+    ]
+    lines.extend(reasons)
+    return "\n".join(lines)
+
+
+def recommendation_keyboard(recipe: dict[str, Any]) -> InlineKeyboardMarkup:
+    recipe_id = int(recipe["id"])
+    category = recipe.get("category", "lunch")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👀 Посмотреть рецепт", callback_data=f"recipe:{recipe_id}:{category}:0")],
+            [InlineKeyboardButton(text="🔄 Предложить другое", callback_data="recommend:again")],
+        ]
+    )
+
+
 dp = Dispatcher()
 
 
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "🍽 <b>Привет! Я бот «Что готовим?»</b>\n\n"
-        "Помогу выбрать завтрак, обед, ужин или перекус для вас с Таней.\n\n"
-        f"Сейчас в базе: <b>{len(RECIPES)} рецептов</b>.",
-        reply_markup=main_keyboard(),
+        format_home_text(),
+        reply_markup=home_keyboard(),
+        parse_mode="HTML",
     )
+    await message.answer("Выбери раздел на клавиатуре 👇", reply_markup=main_keyboard())
 
 
 @dp.message(F.text.in_(list(TEXT_TO_CATEGORY.keys())))
@@ -788,10 +894,25 @@ async def category_from_keyboard(message: Message):
     await message.answer(format_category(category, 0), reply_markup=recipe_list_keyboard(category, 0))
 
 
-@dp.message(F.text == "🎲 Что приготовить?")
+@dp.message(F.text.in_(["🎲 Подобрать блюдо", "🎲 Что приготовить?", "✨ Подобрать блюдо"]))
 async def random_recipe_message(message: Message):
-    recipe = random.choice(RECIPES)
-    await message.answer(format_recipe(recipe), reply_markup=recipe_actions_keyboard(recipe["id"], recipe.get("category")), parse_mode="HTML")
+    recipe, reasons = recommend_recipe(message.from_user.id)
+    await message.answer(
+        format_recommendation(recipe, reasons),
+        reply_markup=recommendation_keyboard(recipe),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("recommend:"))
+async def recommend_callback(callback: CallbackQuery):
+    recipe, reasons = recommend_recipe(callback.from_user.id)
+    await callback.message.edit_text(
+        format_recommendation(recipe, reasons),
+        reply_markup=recommendation_keyboard(recipe),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @dp.message(F.text == "🔍 Поиск")
