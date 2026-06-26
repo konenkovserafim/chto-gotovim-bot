@@ -1249,19 +1249,143 @@ def week_replace_menu_keyboard(menu: dict[str, list[dict[str, Any]]]) -> InlineK
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def add_weekly_menu_to_shopping(user_id: int) -> int:
-    menu = get_saved_weekly_menu(user_id)
-    added = 0
-    seen: set[str] = set()
+def normalize_product_name(name: str) -> str:
+    """Приводит название продукта к аккуратному виду для списка покупок."""
+    cleaned = " ".join(str(name).strip().split())
+    if not cleaned:
+        return cleaned
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def is_taste_item(text: str) -> bool:
+    """Определяет продукты без точного количества: «по вкусу»."""
+    return "по вкусу" in str(text).lower()
+
+
+def parse_ingredient_line(line: str) -> tuple[str, float, str] | None:
+    """Пробует разобрать строку ингредиента вида «Молоко — 400 мл».
+
+    Возвращает: (название, количество, единица).
+    Объединяем только безопасные случаи: число + одинаковая единица.
+    Сложные строки вроде «по вкусу» не объединяем.
+    """
+    text = str(line).strip()
+    if not text or is_taste_item(text):
+        return None
+
+    if "—" in text:
+        name, amount_part = text.split("—", 1)
+    elif "-" in text:
+        name, amount_part = text.split("-", 1)
+    else:
+        return None
+
+    name = normalize_product_name(name)
+    amount_part = amount_part.strip()
+    if not name or not amount_part:
+        return None
+
+    pieces = amount_part.split()
+    if not pieces:
+        return None
+
+    raw_amount = pieces[0].replace(",", ".")
+    try:
+        amount = float(raw_amount)
+    except ValueError:
+        return None
+
+    unit = " ".join(pieces[1:]).strip().lower()
+    if not unit:
+        unit = "шт."
+
+    return name, amount, unit
+
+
+def format_amount(amount: float) -> str:
+    if amount.is_integer():
+        return str(int(amount))
+    return str(round(amount, 2)).replace(".", ",")
+
+
+def normalize_shopping_text(item: str) -> str:
+    """Нормализует строку покупки без изменения смысла."""
+    text = " ".join(str(item).strip().split())
+    if "—" in text:
+        name, rest = text.split("—", 1)
+        return f"{normalize_product_name(name)} — {rest.strip()}"
+    if "-" in text:
+        name, rest = text.split("-", 1)
+        return f"{normalize_product_name(name)} — {rest.strip()}"
+    return normalize_product_name(text)
+
+
+def split_taste_items(items: list[str]) -> tuple[list[str], list[str]]:
+    regular: list[str] = []
+    taste: list[str] = []
+    for item in items:
+        normalized = normalize_shopping_text(item)
+        if is_taste_item(normalized):
+            taste.append(normalized)
+        else:
+            regular.append(normalized)
+    return regular, taste
+
+
+def build_weekly_shopping_items(menu: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """Собирает продукты из меню недели и аккуратно объединяет одинаковые.
+
+    Работает с текущим форматом recipes.json, где ингредиенты — обычные строки.
+    Объединяет только одинаковые продукты с одинаковой единицей измерения.
+    Остальное добавляет как есть, но без точных дублей и с аккуратным регистром.
+    """
+    totals: dict[tuple[str, str], dict[str, Any]] = {}
+    raw_items: list[str] = []
+
     for items in menu.values():
         for recipe in items:
             for ingredient in recipe.get("ingredients", []):
-                ingredient = str(ingredient).strip()
-                if not ingredient or ingredient in seen:
+                text = str(ingredient).strip()
+                if not text:
                     continue
-                seen.add(ingredient)
-                if add_shopping_item_db(user_id, ingredient):
-                    added += 1
+
+                parsed = parse_ingredient_line(text)
+                if not parsed:
+                    raw_items.append(normalize_shopping_text(text))
+                    continue
+
+                name, amount, unit = parsed
+                key = (name.lower(), unit.lower())
+                if key not in totals:
+                    totals[key] = {"name": name, "amount": 0.0, "unit": unit}
+                totals[key]["amount"] += amount
+
+    result = [
+        f"{item['name']} — {format_amount(item['amount'])} {item['unit']}"
+        for item in totals.values()
+    ]
+
+    seen = {item.lower() for item in result}
+    for item in raw_items:
+        key = item.lower()
+        if key not in seen:
+            result.append(item)
+            seen.add(key)
+
+    regular, taste = split_taste_items(result)
+    return sorted(regular, key=str.lower) + sorted(taste, key=str.lower)
+
+
+def add_weekly_menu_to_shopping(user_id: int) -> int:
+    """Добавляет объединённые ингредиенты из текущего меню недели в покупки."""
+    menu = get_saved_weekly_menu(user_id)
+    shopping_items = build_weekly_shopping_items(menu)
+    added = 0
+
+    for item in shopping_items:
+        if add_shopping_item_db(user_id, item):
+            added += 1
+
     return added
 
 
@@ -1282,21 +1406,232 @@ def format_portions(recipe: dict[str, Any], user_id: int) -> str:
     lines.append("🛒 В список покупок всё равно добавляются общие ингредиенты на двоих.")
     return "\n".join(lines)
 
+
+def _has_word(text: str, words: list[str]) -> bool:
+    text_low = text.lower()
+    return any(word.lower() in text_low for word in words)
+
+
+def _ingredient_names(recipe: dict[str, Any]) -> str:
+    return " ".join(recipe.get("ingredients", [])).lower()
+
+
+def detailed_steps_for_recipe(recipe: dict[str, Any]) -> list[str]:
+    """Возвращает шаги из базы рецептов.
+
+    Если в recipes.json уже есть нормальные подробные шаги, бот больше не
+    заменяет их универсальным шаблоном. Шаблоны ниже используются только как
+    запасной вариант для совсем коротких старых рецептов.
+    """
+    name = recipe.get("name", "Блюдо")
+    name_low = name.lower()
+    ingredients_text = _ingredient_names(recipe)
+    base_steps = [str(step).strip().rstrip(".") for step in recipe.get("steps", []) if str(step).strip()]
+
+    # Если рецепт уже подробно расписан в recipes.json — показываем именно его.
+    # Это убирает одинаковые шаблонные инструкции у омлетов, яичниц и похожих блюд.
+    if len(base_steps) >= 4 or any(len(step) >= 70 for step in base_steps):
+        return [step + "." if not step.endswith((".", "!", "?")) else step for step in base_steps]
+
+    # Запасные сценарии для старых коротких рецептов.
+    if _has_word(name_low, ["паста", "спагетти", "макароны"]):
+        steps = [
+            "Поставьте кастрюлю с водой на сильный огонь, посолите и доведите до кипения.",
+            "Отварите пасту до состояния al dente по инструкции на упаковке. Перед сливом оставьте немного воды от варки.",
+        ]
+        if _has_word(ingredients_text, ["лук"]):
+            steps.append("Пока варится паста, мелко нарежьте лук.")
+        if _has_word(ingredients_text, ["фарш"]):
+            steps.append("Разогрейте сковороду, добавьте немного масла и обжарьте лук 3–4 минуты до мягкости.")
+            steps.append("Добавьте фарш и готовьте 7–10 минут, разбивая комочки лопаткой.")
+        elif _has_word(ingredients_text, ["куриц"]):
+            steps.append("Нарежьте курицу небольшими кусочками и обжарьте на сковороде до готовности.")
+        if _has_word(ingredients_text, ["томат", "соус"]):
+            steps.append("Добавьте томатный соус, перемешайте и тушите 7–10 минут на среднем огне.")
+        if _has_word(ingredients_text, ["сливк"]):
+            steps.append("Влейте сливки, прогрейте соус 3–5 минут и не доводите до сильного кипения.")
+        steps.append("Соедините пасту с соусом, перемешайте. Если соус густой, добавьте немного воды от пасты.")
+        steps.append("Подавайте горячей. По желанию добавьте зелень или тёртый сыр.")
+        return steps
+
+    if _has_word(name_low, ["омлет", "яичница"]):
+        steps = [
+            "Подготовьте все ингредиенты: яйца разбейте в миску, овощи или начинку нарежьте небольшими кусочками.",
+            "Взбейте яйца вилкой или венчиком до однородности. При желании добавьте немного молока, соль и специи.",
+        ]
+        if _has_word(ingredients_text, ["овощ", "помидор", "перец", "лук", "гриб"]):
+            steps.append("Разогрейте сковороду и слегка обжарьте овощи 3–5 минут, чтобы они стали мягче.")
+        steps.append("Влейте яичную смесь на сковороду и готовьте на слабом или среднем огне под крышкой.")
+        steps.append("Когда верх схватится, снимите блюдо с огня и дайте постоять 1–2 минуты.")
+        steps.append("Подавайте сразу, пока омлет нежный и горячий.")
+        return steps
+
+    if _has_word(name_low, ["суп", "борщ", "щи"]):
+        steps = [
+            "Подготовьте ингредиенты: овощи вымойте и нарежьте, мясо или курицу при необходимости разделите на кусочки.",
+            "В кастрюле доведите воду или бульон до кипения.",
+            "Добавьте продукты, которым нужно больше времени: мясо, картофель, крупу или капусту.",
+            "Пока основа варится, сделайте зажарку: обжарьте лук и морковь на небольшом количестве масла.",
+            "Добавьте зажарку в кастрюлю, перемешайте и варите до мягкости всех ингредиентов.",
+            "Посолите и приправьте по вкусу. Дайте супу настояться 10 минут под крышкой.",
+            "Подавайте горячим. По желанию добавьте зелень или сметану.",
+        ]
+        return steps
+
+    if _has_word(name_low, ["салат"]):
+        steps = [
+            "Вымойте и обсушите овощи и зелень.",
+        ]
+        if _has_word(ingredients_text, ["куриц"]):
+            steps.append("Курицу отварите, запеките или обжарьте до готовности, затем немного остудите и нарежьте.")
+        if _has_word(ingredients_text, ["яйц"]):
+            steps.append("Яйца отварите вкрутую, остудите и нарежьте.")
+        steps.extend([
+            "Нарежьте остальные ингредиенты удобными кусочками.",
+            "Сложите всё в большую миску, добавьте заправку и аккуратно перемешайте.",
+            "Попробуйте на соль и специи. При необходимости добавьте немного масла, лимонного сока или соуса.",
+            "Подавайте сразу после приготовления, чтобы овощи оставались свежими.",
+        ])
+        return steps
+
+    if _has_word(name_low, ["каша", "овсян", "гречнев", "рисов"]):
+        steps = [
+            "Промойте крупу, если это нужно для выбранного вида крупы.",
+            "В кастрюле соедините крупу с водой или молоком, добавьте щепотку соли.",
+            "Доведите до кипения, затем уменьшите огонь и варите до мягкости, периодически помешивая.",
+            "Когда каша загустеет, снимите её с огня и дайте постоять 3–5 минут под крышкой.",
+            "Добавьте масло, мёд, фрукты или другие добавки по вкусу.",
+            "Подавайте тёплой.",
+        ]
+        return steps
+
+    if _has_word(name_low, ["сырники", "запеканка"]):
+        steps = [
+            "Разомните творог вилкой или пробейте блендером, если хотите более нежную текстуру.",
+            "Добавьте яйца, сахар и муку или манку. Перемешайте до однородности.",
+            "Оставьте массу на 5–10 минут, чтобы она стала плотнее.",
+        ]
+        if _has_word(name_low, ["сырники"]):
+            steps.append("Сформируйте сырники влажными руками и слегка обваляйте в муке.")
+            steps.append("Обжарьте на среднем огне по 3–4 минуты с каждой стороны до румяной корочки.")
+        else:
+            steps.append("Переложите массу в форму для запекания и разровняйте.")
+            steps.append("Запекайте до румяности и готовности внутри.")
+        steps.append("Подавайте со сметаной, ягодами, мёдом или фруктами.")
+        return steps
+
+    # Универсальное расширение коротких шагов из базы.
+    steps = ["Подготовьте ингредиенты: вымойте, очистите и нарежьте всё, что нужно по рецепту."]
+    for step in base_steps:
+        steps.append(step + ".")
+    steps.append("В конце попробуйте блюдо и при необходимости добавьте соль, специи или зелень.")
+    steps.append("Дайте блюду немного постоять перед подачей, чтобы вкус стал более цельным.")
+    return steps
+
+
+def recipe_tips(recipe: dict[str, Any]) -> list[str]:
+    name_low = recipe.get("name", "").lower()
+    ingredients_text = _ingredient_names(recipe)
+    tips: list[str] = []
+
+    if _has_word(name_low, ["паста", "макароны", "спагетти"]):
+        tips.append("Пасту лучше слегка недоварить: она дойдёт до готовности в соусе.")
+        tips.append("Немного воды от пасты помогает сделать соус более гладким.")
+    elif _has_word(name_low, ["суп", "борщ", "щи"]):
+        tips.append("Суп станет вкуснее, если дать ему настояться 10–15 минут после приготовления.")
+    elif _has_word(name_low, ["салат"]):
+        tips.append("Заправляйте салат перед подачей, чтобы овощи не дали лишний сок.")
+    elif _has_word(name_low, ["омлет", "яичница"]):
+        tips.append("Готовьте яйца на умеренном огне: так блюдо получится нежнее.")
+    elif _has_word(name_low, ["каша", "овсян"]):
+        tips.append("Если каша получилась густой, добавьте немного молока или воды и прогрейте ещё минуту.")
+    else:
+        tips.append("Не спешите увеличивать огонь: большинство домашних блюд вкуснее при спокойном приготовлении.")
+
+    if _has_word(ingredients_text, ["куриц", "фарш", "рыб", "мяс"]):
+        tips.append("Мясо, рыбу или курицу лучше не пересушивать: снимайте с огня сразу после готовности.")
+    return tips[:3]
+
+
+def recipe_storage(recipe: dict[str, Any]) -> list[str]:
+    name_low = recipe.get("name", "").lower()
+    if _has_word(name_low, ["салат"]):
+        return [
+            "Лучше есть свежим.",
+            "Если нужно хранить — держите без заправки до 1 суток в холодильнике.",
+        ]
+    if _has_word(name_low, ["суп", "борщ", "щи"]):
+        return [
+            "В холодильнике хранится до 3 суток.",
+            "Разогревать лучше порционно, не кипятя весь объём каждый раз.",
+        ]
+    return [
+        "В холодильнике хранится до 2–3 суток.",
+        "Разогревать лучше на сковороде или в микроволновке небольшими порциями.",
+    ]
+
+
+def recipe_replacements(recipe: dict[str, Any]) -> list[str]:
+    ingredients_text = _ingredient_names(recipe)
+    replacements: list[str] = []
+    if _has_word(ingredients_text, ["куриц"]):
+        replacements.append("Курицу можно заменить индейкой.")
+    if _has_word(ingredients_text, ["фарш"]):
+        replacements.append("Фарш можно взять говяжий, куриный или смешанный.")
+    if _has_word(ingredients_text, ["молоко"]):
+        replacements.append("Молоко можно заменить водой или растительным напитком, если это подходит блюду.")
+    if _has_word(ingredients_text, ["сметана"]):
+        replacements.append("Сметану можно заменить натуральным йогуртом.")
+    if _has_word(ingredients_text, ["рис"]):
+        replacements.append("Рис можно заменить гречкой, булгуром или кускусом.")
+    if _has_word(ingredients_text, ["паста", "макароны"]):
+        replacements.append("Пасту можно заменить макаронами из твёрдых сортов пшеницы.")
+    if not replacements:
+        replacements.append("Часть ингредиентов можно заменить похожими по вкусу и текстуре продуктами.")
+    return replacements[:3]
+
+
+def recipe_serving(recipe: dict[str, Any]) -> list[str]:
+    name_low = recipe.get("name", "").lower()
+    if _has_word(name_low, ["паста", "макароны", "мяс", "куриц", "рыб", "котлет"]):
+        return ["Овощной салат", "Свежая зелень", "Лёгкий соус по вкусу"]
+    if _has_word(name_low, ["суп", "борщ", "щи"]):
+        return ["Зелень", "Сметана", "Хлеб или сухарики"]
+    if _has_word(name_low, ["каша", "сырники", "запеканка"]):
+        return ["Фрукты или ягоды", "Мёд", "Йогурт или сметана"]
+    if _has_word(name_low, ["салат"]):
+        return ["Хлебцы", "Запечённая курица или рыба", "Лимонный сок"]
+    return ["Свежие овощи", "Зелень", "Любимый соус"]
+
+
 def format_recipe(r: dict[str, Any]) -> str:
-    ingredients = "\n".join(f"• {item}" for item in r.get("ingredients", []))
-    steps = "\n".join(f"{i}. {step}" for i, step in enumerate(r.get("steps", []), 1))
+    ingredients = "\n".join(f"• {item}" for item in r.get("ingredients", [])) or "• Ингредиенты не указаны"
+    steps = "\n".join(f"{i}. {step}" for i, step in enumerate(detailed_steps_for_recipe(r), 1))
+    tips = "\n".join(f"• {tip}" for tip in recipe_tips(r))
+    storage = "\n".join(f"• {item}" for item in recipe_storage(r))
+    replacements = "\n".join(f"• {item}" for item in recipe_replacements(r))
+    serving = "\n".join(f"• {item}" for item in recipe_serving(r))
     tags = ", ".join(r.get("tags", []))
 
-    return (
+    text = (
         f"🍽 <b>{r['name']}</b>\n\n"
-        f"⏱ Время: {r.get('time', '—')} мин\n"
-        f"🔥 Калорийность на двоих: ~{r.get('calories', '—')} ккал\n"
-        f"💰 Примерно: ~{r.get('price', '—')} ₽\n"
-        f"🍳 Сложность: {r.get('difficulty', 'Легко')}\n\n"
+        f"⏱ <b>Время:</b> {r.get('time', '—')} мин\n"
+        f"🔥 <b>Калорийность на двоих:</b> ~{r.get('calories', '—')} ккал\n"
+        f"💰 <b>Примерно:</b> ~{r.get('price', '—')} ₽\n"
+        f"🍳 <b>Сложность:</b> {r.get('difficulty', 'Легко')}\n\n"
+        f"━━━━━━━━━━━━━━\n\n"
         f"🛒 <b>Ингредиенты</b>\n{ingredients}\n\n"
+        f"━━━━━━━━━━━━━━\n\n"
         f"👨‍🍳 <b>Приготовление</b>\n{steps}\n\n"
-        f"🏷 {tags}"
+        f"━━━━━━━━━━━━━━\n\n"
+        f"💡 <b>Советы</b>\n{tips}\n\n"
+        f"📦 <b>Хранение</b>\n{storage}\n\n"
+        f"🔄 <b>Чем заменить</b>\n{replacements}\n\n"
+        f"🍽 <b>Подача</b>\n{serving}"
     )
+    if tags:
+        text += f"\n\n🏷 {tags}"
+    return text
 
 
 def format_category(category: str, page: int = 0) -> str:
@@ -1584,6 +1919,11 @@ async def week_generate_callback(callback: CallbackQuery):
 async def week_shopping_callback(callback: CallbackQuery):
     added = add_weekly_menu_to_shopping(callback.from_user.id)
     await callback.answer(f"Добавлено продуктов: {added} 🛒")
+    await callback.message.answer(
+        f"🛒 Добавлено в список покупок: <b>{added}</b>\n\n"
+        "Одинаковые продукты объединены, где это безопасно.",
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data == "week:replace_menu")
@@ -1750,9 +2090,20 @@ async def shopping_message(message: Message):
     if not items:
         await message.answer("🛒 Список продуктов пока пуст.")
         return
+
+    regular, taste = split_taste_items(items)
+
     lines = ["🛒 <b>Список продуктов</b>", ""]
-    for item in items:
-        lines.append(f"• {item}")
+    for item in sorted(regular, key=str.lower):
+        lines.append(f"☐ {item}")
+
+    if taste:
+        if regular:
+            lines.append("")
+        lines.append("<b>По вкусу:</b>")
+        for item in sorted(taste, key=str.lower):
+            lines.append(f"☐ {item}")
+
     await message.answer("\n".join(lines), reply_markup=clear_keyboard("shopping"), parse_mode="HTML")
 
 
