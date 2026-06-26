@@ -19,6 +19,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -362,6 +363,99 @@ def set_user_flag(user_id: int, key: str, value: str) -> None:
         )
         conn.commit()
 
+
+
+
+ONBOARDING_DONE_KEY = "onboarding_done_v1"
+ONBOARDING_FLOW_KEY = "onboarding_flow_v1"
+
+
+def onboarding_intro_text() -> str:
+    return (
+        "🍽 <b>Добро пожаловать в «Что готовим?»</b>\n\n"
+        "Я помогу вам:\n\n"
+        "🥘 подобрать блюда\n"
+        "🛒 составить список покупок\n"
+        "📅 сделать меню недели\n"
+        "👨‍👩‍👧 учитывать вкусы всей семьи\n\n"
+        "Начнём?"
+    )
+
+
+def onboarding_intro_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Начать", callback_data="onboarding:start")],
+        [InlineKeyboardButton(text="Пропустить", callback_data="onboarding:skip")],
+    ])
+
+
+def onboarding_profile_prompt_text() -> str:
+    return (
+        "👤 <b>Давайте создадим первый профиль.</b>\n\n"
+        "Так бот сможет учитывать предпочтения, ограничения и цели каждого.\n\n"
+        "Введите имя профиля одним сообщением.\n\n"
+        "Например: <b>Серафим</b> или <b>Таня</b>."
+    )
+
+
+def onboarding_add_more_text() -> str:
+    return (
+        "✅ <b>Профиль создан.</b>\n\n"
+        "Хотите добавить ещё одного участника семьи?"
+    )
+
+
+def onboarding_add_more_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить ещё профиль", callback_data="onboarding:add_profile")],
+        [InlineKeyboardButton(text="Пока нет", callback_data="onboarding:notifications")],
+    ])
+
+
+def onboarding_notifications_text() -> str:
+    return (
+        "🔔 <b>Хотите включить уведомления?</b>\n\n"
+        "Я буду напоминать о завтраке, обеде и ужине.\n\n"
+        "Время можно будет изменить позже в настройках."
+    )
+
+
+def onboarding_notifications_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Включить", callback_data="onboarding:notifications_on")],
+        [InlineKeyboardButton(text="Позже", callback_data="onboarding:finish")],
+    ])
+
+
+def onboarding_finish_text(user_id: int) -> str:
+    profiles = get_profiles(user_id)
+    profiles_line = "👤 Профили: <b>{}</b>".format(len(profiles)) if profiles else "👤 Профили можно заполнить позже"
+    notify_line = "🔔 Уведомления: <b>включены</b>" if notifications_enabled(user_id) else "🔔 Уведомления: <b>выключены</b>"
+    return (
+        "🎉 <b>Всё готово!</b>\n\n"
+        "Теперь можно пользоваться ботом.\n\n"
+        f"{profiles_line}\n"
+        f"{notify_line}\n\n"
+        "💡 Чем больше информации вы заполните в профилях и холодильнике,\n"
+        "тем точнее будут мои рекомендации."
+    )
+
+
+def onboarding_finish_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Открыть главный экран", callback_data="onboarding:open_home")],
+        [InlineKeyboardButton(text="👥 Перейти к профилям", callback_data="profiles:list")],
+    ])
+
+
+def onboarding_completed(user_id: int) -> bool:
+    return get_user_flag(user_id, ONBOARDING_DONE_KEY) == "1"
+
+
+def set_onboarding_completed(user_id: int) -> None:
+    set_user_flag(user_id, ONBOARDING_DONE_KEY, "1")
+    delete_user_flag(user_id, ONBOARDING_FLOW_KEY)
+    delete_user_flag(user_id, "awaiting_profile_name")
 
 NOTIFICATION_DEFAULT_TIMES = {
     "breakfast": "09:00",
@@ -1066,6 +1160,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📖 История приготовлений", callback_data="settings:history")],
             [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="history:clear")],
             [InlineKeyboardButton(text="ℹ️ О боте", callback_data="settings:about")],
+            [InlineKeyboardButton(text="🎓 Пройти обучение заново", callback_data="settings:onboarding")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
         ]
     )
@@ -2435,6 +2530,14 @@ async def send_home_screen(message: Message) -> None:
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    if not onboarding_completed(message.from_user.id):
+        await message.answer(
+            onboarding_intro_text(),
+            reply_markup=onboarding_intro_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
     await send_home_screen(message)
 
     # Один раз отправляем Reply-клавиатуру, чтобы появилась кнопка «🏠 Главная».
@@ -2442,6 +2545,97 @@ async def start(message: Message):
     if get_user_flag(message.from_user.id, "reply_keyboard_home_v1") != "1":
         await message.answer("⌨️ Клавиатура обновлена", reply_markup=main_keyboard())
         set_user_flag(message.from_user.id, "reply_keyboard_home_v1", "1")
+
+
+
+@dp.callback_query(F.data == "onboarding:start")
+async def onboarding_start_callback(callback: CallbackQuery):
+    set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
+    set_user_flag(callback.from_user.id, "awaiting_profile_name", "1")
+    await callback.message.edit_text(
+        onboarding_profile_prompt_text(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить", callback_data="onboarding:notifications")],
+        ]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:add_profile")
+async def onboarding_add_profile_callback(callback: CallbackQuery):
+    set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
+    set_user_flag(callback.from_user.id, "awaiting_profile_name", "1")
+    await callback.message.edit_text(
+        onboarding_profile_prompt_text(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Пока достаточно", callback_data="onboarding:notifications")],
+        ]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:notifications")
+async def onboarding_notifications_callback(callback: CallbackQuery):
+    delete_user_flag(callback.from_user.id, "awaiting_profile_name")
+    await callback.message.edit_text(
+        onboarding_notifications_text(),
+        reply_markup=onboarding_notifications_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:notifications_on")
+async def onboarding_notifications_on_callback(callback: CallbackQuery):
+    set_notifications_enabled(callback.from_user.id, True)
+    await callback.message.edit_text(
+        onboarding_finish_text(callback.from_user.id),
+        reply_markup=onboarding_finish_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer("Уведомления включены")
+
+
+@dp.callback_query(F.data == "onboarding:finish")
+async def onboarding_finish_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        onboarding_finish_text(callback.from_user.id),
+        reply_markup=onboarding_finish_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:skip")
+async def onboarding_skip_callback(callback: CallbackQuery):
+    set_onboarding_completed(callback.from_user.id)
+    await callback.message.answer(
+        "Готово. Можно вернуться к знакомству позже в настройках.",
+        reply_markup=main_keyboard(),
+    )
+    await send_home_screen(callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:open_home")
+async def onboarding_open_home_callback(callback: CallbackQuery):
+    set_onboarding_completed(callback.from_user.id)
+    await callback.message.answer("⌨️ Главное меню включено", reply_markup=main_keyboard())
+    await send_home_screen(callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings:onboarding")
+async def settings_onboarding_callback(callback: CallbackQuery):
+    delete_user_flag(callback.from_user.id, ONBOARDING_DONE_KEY)
+    await callback.message.edit_text(
+        onboarding_intro_text(),
+        reply_markup=onboarding_intro_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @dp.message(F.text == "🏠 Главная")
@@ -3357,6 +3551,13 @@ async def fallback(message: Message):
             return
         code = add_profile_db(message.from_user.id, name)
         delete_user_flag(message.from_user.id, "awaiting_profile_name")
+        if get_user_flag(message.from_user.id, ONBOARDING_FLOW_KEY) == "1":
+            await message.answer(
+                onboarding_add_more_text(),
+                reply_markup=onboarding_add_more_keyboard(),
+                parse_mode="HTML",
+            )
+            return
         profile = get_profile(message.from_user.id, code)
         await message.answer(
             profile_detail_text(profile),
