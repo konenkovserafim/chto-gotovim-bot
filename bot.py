@@ -749,6 +749,7 @@ def recipe_list_keyboard(category: str, page: int = 0) -> InlineKeyboardMarkup:
         rows.append(nav)
 
     rows.append([InlineKeyboardButton(text="🎲 Случайное из раздела", callback_data=f"randomcat:{category}")])
+    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -793,13 +794,20 @@ def favorites_keyboard(fav_ids: list[int]) -> InlineKeyboardMarkup:
         if recipe:
             rows.append([InlineKeyboardButton(text=recipe["name"], callback_data=f"favrecipe:{recipe_id}")])
     rows.append([InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")])
+    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def clear_keyboard(kind: str) -> InlineKeyboardMarkup:
     if kind == "favorites":
-        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")]])
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear:shopping")]])
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")],
+            [InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear:shopping")],
+        [InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")],
+    ])
 
 
 
@@ -810,6 +818,7 @@ def product_category_keyboard(selected_codes: list[str]) -> InlineKeyboardMarkup
         rows.append([InlineKeyboardButton(text=group["title"], callback_data=f"fridge:category:{key}")])
     rows.append([InlineKeyboardButton(text="🔎 Найти блюда", callback_data="fridge:find")])
     rows.append([InlineKeyboardButton(text="🧹 Очистить холодильник", callback_data="fridge:clear")])
+    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -906,6 +915,7 @@ def fridge_results_keyboard(results: dict[str, list[tuple[dict[str, Any], set[st
         rows.append([InlineKeyboardButton(text=f"🟡 {recipe['name']} · не хватает: {missing_titles}", callback_data=f"recipe:{recipe['id']}:{recipe.get('category', 'lunch')}:0")])
         shown += 1
     rows.append([InlineKeyboardButton(text="⬅️ К холодильнику", callback_data="fridge:back")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -937,6 +947,8 @@ FILTERS = {
 
 def filter_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=data["title"], callback_data=f"filter:{key}:0")] for key, data in FILTERS.items()]
+    rows.append([InlineKeyboardButton(text="⬅️ К поиску", callback_data="search:new")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -987,6 +999,8 @@ def filter_results_keyboard(kind: str, page: int = 0) -> InlineKeyboardMarkup:
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="⚙️ Все фильтры", callback_data="filters:menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ К поиску", callback_data="search:new")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1025,6 +1039,7 @@ def about_text(user_id: int) -> str:
 def about_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
         ]
     )
@@ -1111,6 +1126,7 @@ def search_results_keyboard(query: str, page: int = 0) -> InlineKeyboardMarkup:
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search:new")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1349,7 +1365,7 @@ def weekly_menu_keyboard(has_menu: bool = False) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🧹 Очистить меню", callback_data="week:clear")])
     else:
         rows.append([InlineKeyboardButton(text="📅 Составить меню на неделю", callback_data="week:generate")])
-    rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
