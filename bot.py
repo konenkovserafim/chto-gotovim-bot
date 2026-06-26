@@ -1250,18 +1250,25 @@ def week_replace_menu_keyboard(menu: dict[str, list[dict[str, Any]]]) -> InlineK
 
 
 def add_weekly_menu_to_shopping(user_id: int) -> int:
+    """Добавляет ингредиенты из текущего меню недели в список покупок.
+
+    Важно: в recipes.json ингредиенты сейчас хранятся обычными строками
+    вроде "Молоко — 400 мл", поэтому в этой версии мы ничего не
+    суммируем и не разбираем. Просто добавляем все строки ингредиентов.
+    Объединение одинаковых продуктов сделаем отдельным безопасным шагом.
+    """
     menu = get_saved_weekly_menu(user_id)
     added = 0
-    seen: set[str] = set()
+
     for items in menu.values():
         for recipe in items:
             for ingredient in recipe.get("ingredients", []):
                 ingredient = str(ingredient).strip()
-                if not ingredient or ingredient in seen:
+                if not ingredient:
                     continue
-                seen.add(ingredient)
                 if add_shopping_item_db(user_id, ingredient):
                     added += 1
+
     return added
 
 
@@ -1584,6 +1591,12 @@ async def week_generate_callback(callback: CallbackQuery):
 async def week_shopping_callback(callback: CallbackQuery):
     added = add_weekly_menu_to_shopping(callback.from_user.id)
     await callback.answer(f"Добавлено продуктов: {added} 🛒")
+    await callback.message.answer(
+        f"🛒 Добавлено в список покупок: <b>{added}</b>\n\n"
+        "Одинаковые продукты пока могут повторяться. "
+        "Объединение сделаем отдельным шагом.",
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data == "week:replace_menu")
