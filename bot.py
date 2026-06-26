@@ -1417,13 +1417,23 @@ def _ingredient_names(recipe: dict[str, Any]) -> str:
 
 
 def detailed_steps_for_recipe(recipe: dict[str, Any]) -> list[str]:
-    """Делает приготовление более подробным, даже если в базе шаги короткие."""
+    """Возвращает шаги из базы рецептов.
+
+    Если в recipes.json уже есть нормальные подробные шаги, бот больше не
+    заменяет их универсальным шаблоном. Шаблоны ниже используются только как
+    запасной вариант для совсем коротких старых рецептов.
+    """
     name = recipe.get("name", "Блюдо")
     name_low = name.lower()
     ingredients_text = _ingredient_names(recipe)
     base_steps = [str(step).strip().rstrip(".") for step in recipe.get("steps", []) if str(step).strip()]
 
-    # Небольшие ручные сценарии для самых частых типов блюд.
+    # Если рецепт уже подробно расписан в recipes.json — показываем именно его.
+    # Это убирает одинаковые шаблонные инструкции у омлетов, яичниц и похожих блюд.
+    if len(base_steps) >= 4 or any(len(step) >= 70 for step in base_steps):
+        return [step + "." if not step.endswith((".", "!", "?")) else step for step in base_steps]
+
+    # Запасные сценарии для старых коротких рецептов.
     if _has_word(name_low, ["паста", "спагетти", "макароны"]):
         steps = [
             "Поставьте кастрюлю с водой на сильный огонь, посолите и доведите до кипения.",
