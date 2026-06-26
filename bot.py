@@ -1320,7 +1320,11 @@ def merge_ingredient_lines(ingredients: list[str]) -> list[str]:
     return sorted(result, key=lambda x: x.lower())
 
 
-def add_weekly_menu_to_shopping(user_id: int) -> int:
+def add_weekly_menu_to_shopping(user_id: int) -> tuple[int, int, list[str]]:
+    """Добавляет объединённые продукты из меню недели в список покупок.
+
+    Возвращает: (добавлено новых, всего продуктов в меню, итоговый список ингредиентов).
+    """
     menu = get_saved_weekly_menu(user_id)
     all_ingredients: list[str] = []
     for items in menu.values():
@@ -1328,11 +1332,13 @@ def add_weekly_menu_to_shopping(user_id: int) -> int:
             all_ingredients.extend(str(i).strip() for i in recipe.get("ingredients", []) if str(i).strip())
 
     merged_ingredients = merge_ingredient_lines(all_ingredients)
+
     added = 0
     for ingredient in merged_ingredients:
         if add_shopping_item_db(user_id, ingredient):
             added += 1
-    return added
+
+    return added, len(merged_ingredients), merged_ingredients
 
 
 def format_portions(recipe: dict[str, Any], user_id: int) -> str:
@@ -1652,8 +1658,24 @@ async def week_generate_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "week:shopping")
 async def week_shopping_callback(callback: CallbackQuery):
-    added = add_weekly_menu_to_shopping(callback.from_user.id)
-    await callback.answer(f"Добавлено продуктов: {added} 🛒")
+    added, total, ingredients = add_weekly_menu_to_shopping(callback.from_user.id)
+
+    if not ingredients:
+        await callback.answer("Сначала составь меню недели", show_alert=True)
+        return
+
+    preview = "\n".join(f"• {item}" for item in ingredients[:25])
+    if len(ingredients) > 25:
+        preview += f"\n…и ещё {len(ingredients) - 25}"
+
+    await callback.message.answer(
+        "🛒 <b>Продукты из меню недели добавлены</b>\n\n"
+        f"Добавлено новых: <b>{added}</b> из <b>{total}</b>.\n"
+        "Если часть продуктов уже была в списке, она не дублируется.\n\n"
+        f"{preview}",
+        parse_mode="HTML",
+    )
+    await callback.answer("Список покупок обновлён 🛒")
 
 
 @dp.callback_query(F.data == "week:replace_menu")
