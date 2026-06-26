@@ -346,6 +346,135 @@ def set_user_flag(user_id: int, key: str, value: str) -> None:
         conn.commit()
 
 
+NOTIFICATION_DEFAULT_TIMES = {
+    "breakfast": "09:00",
+    "lunch": "14:00",
+    "dinner": "19:00",
+}
+
+MEAL_TITLES = {
+    "breakfast": "☀️ Завтрак",
+    "lunch": "🍲 Обед",
+    "dinner": "🌙 Ужин",
+}
+
+MEAL_HOME_TEXTS = {
+    "breakfast": "☀️ <b>Доброе утро!</b>\n\nЧем позавтракаем?",
+    "lunch": "🍲 <b>Пора подумать об обеде.</b>",
+    "dinner": "🌙 <b>Что приготовим на ужин?</b>",
+}
+
+MEAL_TIME_OPTIONS = {
+    "breakfast": ["07:00", "08:00", "09:00", "10:00"],
+    "lunch": ["12:00", "13:00", "14:00", "15:00"],
+    "dinner": ["18:00", "19:00", "20:00", "21:00"],
+}
+
+
+def get_notification_time(user_id: int, meal: str) -> str:
+    return get_user_flag(user_id, f"notify_time_{meal}") or NOTIFICATION_DEFAULT_TIMES[meal]
+
+
+def notifications_enabled(user_id: int) -> bool:
+    return get_user_flag(user_id, "notifications_enabled") == "1"
+
+
+def set_notifications_enabled(user_id: int, enabled: bool) -> None:
+    set_user_flag(user_id, "notifications_enabled", "1" if enabled else "0")
+
+
+def get_notification_users() -> list[int]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT user_id FROM user_flags WHERE key = 'notifications_enabled' AND value = '1'"
+        ).fetchall()
+    return [int(row["user_id"]) for row in rows]
+
+
+def notification_settings_text(user_id: int) -> str:
+    status = "включены ✅" if notifications_enabled(user_id) else "выключены ❌"
+    return (
+        "🔔 <b>Уведомления</b>\n\n"
+        f"Статус: <b>{status}</b>\n\n"
+        f"☀️ Завтрак: <b>{get_notification_time(user_id, 'breakfast')}</b>\n"
+        f"🍲 Обед: <b>{get_notification_time(user_id, 'lunch')}</b>\n"
+        f"🌙 Ужин: <b>{get_notification_time(user_id, 'dinner')}</b>\n\n"
+        "Бот будет присылать главный экран в выбранное время."
+    )
+
+
+def notification_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    toggle_text = "🔕 Выключить уведомления" if notifications_enabled(user_id) else "🔔 Включить уведомления"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=toggle_text, callback_data="notify:toggle")],
+            [InlineKeyboardButton(text=f"☀️ Завтрак — {get_notification_time(user_id, 'breakfast')}", callback_data="notify:time:breakfast")],
+            [InlineKeyboardButton(text=f"🍲 Обед — {get_notification_time(user_id, 'lunch')}", callback_data="notify:time:lunch")],
+            [InlineKeyboardButton(text=f"🌙 Ужин — {get_notification_time(user_id, 'dinner')}", callback_data="notify:time:dinner")],
+            [InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
+    )
+
+
+def notification_time_keyboard(meal: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=time, callback_data=f"notify:set:{meal}:{time.replace(':', '')}")]
+        for time in MEAL_TIME_OPTIONS.get(meal, [])
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ К уведомлениям", callback_data="settings:notifications")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def notification_time_text(user_id: int, meal: str) -> str:
+    return (
+        f"⏰ <b>{MEAL_TITLES.get(meal, 'Время')}</b>\n\n"
+        f"Сейчас выбрано: <b>{get_notification_time(user_id, meal)}</b>\n\n"
+        "Выбери новое время."
+    )
+
+
+def home_text_for_category(category: str) -> str:
+    return MEAL_HOME_TEXTS.get(category, format_home_text())
+
+
+def home_keyboard_for_category(category: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✨ Подобрать блюдо", callback_data="recommend:now")],
+            [InlineKeyboardButton(text=CATEGORY_TITLES.get(category, "🍽 Блюда"), callback_data=f"cat:{category}:0")],
+        ]
+    )
+
+
+async def notification_loop(bot: Bot) -> None:
+    await asyncio.sleep(5)
+    while True:
+        try:
+            tz = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Moscow"))
+            now = datetime.now(tz)
+            current_time = now.strftime("%H:%M")
+            today = now.date().isoformat()
+
+            for user_id in get_notification_users():
+                for meal in ("breakfast", "lunch", "dinner"):
+                    if get_notification_time(user_id, meal) != current_time:
+                        continue
+                    last_key = f"notify_last_{meal}"
+                    if get_user_flag(user_id, last_key) == today:
+                        continue
+                    await bot.send_message(
+                        user_id,
+                        home_text_for_category(meal),
+                        reply_markup=home_keyboard_for_category(meal),
+                        parse_mode="HTML",
+                    )
+                    set_user_flag(user_id, last_key, today)
+        except Exception:
+            logger.exception("Notification loop failed")
+        await asyncio.sleep(30)
+
+
 def add_cooked_recipe(user_id: int, recipe_id: int) -> int:
     cooked_at = datetime.now(ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Moscow"))).isoformat(timespec="seconds")
     with db_connect() as conn:
@@ -620,6 +749,7 @@ def recipe_list_keyboard(category: str, page: int = 0) -> InlineKeyboardMarkup:
         rows.append(nav)
 
     rows.append([InlineKeyboardButton(text="🎲 Случайное из раздела", callback_data=f"randomcat:{category}")])
+    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -664,13 +794,20 @@ def favorites_keyboard(fav_ids: list[int]) -> InlineKeyboardMarkup:
         if recipe:
             rows.append([InlineKeyboardButton(text=recipe["name"], callback_data=f"favrecipe:{recipe_id}")])
     rows.append([InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")])
+    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def clear_keyboard(kind: str) -> InlineKeyboardMarkup:
     if kind == "favorites":
-        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")]])
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear:shopping")]])
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")],
+            [InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear:shopping")],
+        [InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")],
+    ])
 
 
 
@@ -681,6 +818,7 @@ def product_category_keyboard(selected_codes: list[str]) -> InlineKeyboardMarkup
         rows.append([InlineKeyboardButton(text=group["title"], callback_data=f"fridge:category:{key}")])
     rows.append([InlineKeyboardButton(text="🔎 Найти блюда", callback_data="fridge:find")])
     rows.append([InlineKeyboardButton(text="🧹 Очистить холодильник", callback_data="fridge:clear")])
+    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -777,6 +915,7 @@ def fridge_results_keyboard(results: dict[str, list[tuple[dict[str, Any], set[st
         rows.append([InlineKeyboardButton(text=f"🟡 {recipe['name']} · не хватает: {missing_titles}", callback_data=f"recipe:{recipe['id']}:{recipe.get('category', 'lunch')}:0")])
         shown += 1
     rows.append([InlineKeyboardButton(text="⬅️ К холодильнику", callback_data="fridge:back")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -808,6 +947,8 @@ FILTERS = {
 
 def filter_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=data["title"], callback_data=f"filter:{key}:0")] for key, data in FILTERS.items()]
+    rows.append([InlineKeyboardButton(text="⬅️ К поиску", callback_data="search:new")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -858,6 +999,8 @@ def filter_results_keyboard(kind: str, page: int = 0) -> InlineKeyboardMarkup:
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="⚙️ Все фильтры", callback_data="filters:menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ К поиску", callback_data="search:new")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -865,10 +1008,8 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:notifications")],
-            [InlineKeyboardButton(text="⏰ Время завтрака", callback_data="settings:breakfast_time")],
-            [InlineKeyboardButton(text="⏰ Время обеда", callback_data="settings:lunch_time")],
-            [InlineKeyboardButton(text="⏰ Время ужина", callback_data="settings:dinner_time")],
             [InlineKeyboardButton(text="👥 Профили", callback_data="settings:profiles")],
+            [InlineKeyboardButton(text="📖 История приготовлений", callback_data="settings:history")],
             [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="history:clear")],
             [InlineKeyboardButton(text="ℹ️ О боте", callback_data="settings:about")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
@@ -898,6 +1039,7 @@ def about_text(user_id: int) -> str:
 def about_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
         ]
     )
@@ -984,6 +1126,7 @@ def search_results_keyboard(query: str, page: int = 0) -> InlineKeyboardMarkup:
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search:new")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1222,7 +1365,7 @@ def weekly_menu_keyboard(has_menu: bool = False) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🧹 Очистить меню", callback_data="week:clear")])
     else:
         rows.append([InlineKeyboardButton(text="📅 Составить меню на неделю", callback_data="week:generate")])
-    rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1885,26 +2028,53 @@ async def settings_menu_callback(callback: CallbackQuery):
 @dp.callback_query(F.data == "settings:notifications")
 async def settings_notifications_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "🔔 <b>Уведомления</b>\n\n🚧 Скоро появится. Здесь настроим напоминания на завтрак, обед и ужин.",
-        reply_markup=back_to_settings_keyboard(),
+        notification_settings_text(callback.from_user.id),
+        reply_markup=notification_settings_keyboard(callback.from_user.id),
         parse_mode="HTML",
     )
     await callback.answer()
 
 
-@dp.callback_query(F.data.in_({"settings:breakfast_time", "settings:lunch_time", "settings:dinner_time"}))
-async def settings_meal_time_callback(callback: CallbackQuery):
-    titles = {
-        "settings:breakfast_time": "⏰ <b>Время завтрака</b>",
-        "settings:lunch_time": "⏰ <b>Время обеда</b>",
-        "settings:dinner_time": "⏰ <b>Время ужина</b>",
-    }
+@dp.callback_query(F.data == "notify:toggle")
+async def notifications_toggle_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    set_notifications_enabled(user_id, not notifications_enabled(user_id))
     await callback.message.edit_text(
-        f"{titles.get(callback.data, '⏰ <b>Время приёма пищи</b>')}\n\n🚧 Скоро здесь можно будет настроить удобное время напоминаний.",
-        reply_markup=back_to_settings_keyboard(),
+        notification_settings_text(user_id),
+        reply_markup=notification_settings_keyboard(user_id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Настройки уведомлений обновлены")
+
+
+@dp.callback_query(F.data.startswith("notify:time:"))
+async def notifications_time_callback(callback: CallbackQuery):
+    meal = callback.data.split(":", 2)[2]
+    if meal not in NOTIFICATION_DEFAULT_TIMES:
+        await callback.answer("Неизвестный приём пищи", show_alert=True)
+        return
+    await callback.message.edit_text(
+        notification_time_text(callback.from_user.id, meal),
+        reply_markup=notification_time_keyboard(meal),
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("notify:set:"))
+async def notifications_set_time_callback(callback: CallbackQuery):
+    _, _, meal, raw_time = callback.data.split(":")
+    if meal not in NOTIFICATION_DEFAULT_TIMES or len(raw_time) != 4 or not raw_time.isdigit():
+        await callback.answer("Некорректное время", show_alert=True)
+        return
+    time_value = f"{raw_time[:2]}:{raw_time[2:]}"
+    set_user_flag(callback.from_user.id, f"notify_time_{meal}", time_value)
+    await callback.message.edit_text(
+        notification_settings_text(callback.from_user.id),
+        reply_markup=notification_settings_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer(f"Время сохранено: {time_value}")
 
 
 @dp.callback_query(F.data == "settings:history")
@@ -2399,6 +2569,7 @@ async def fallback(message: Message):
 async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     logger.info("Bot started. Recipes loaded: %s", len(RECIPES))
+    asyncio.create_task(notification_loop(bot))
     await dp.start_polling(bot)
 
 
