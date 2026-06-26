@@ -1130,6 +1130,10 @@ def get_saved_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
     return menu
 
 
+def clear_weekly_menu(user_id: int) -> None:
+    set_user_flag(user_id, "weekly_menu_ids", "")
+
+
 def format_weekly_menu(menu: dict[str, list[dict[str, Any]]]) -> str:
     if not menu:
         return (
@@ -1155,6 +1159,7 @@ def weekly_menu_keyboard(has_menu: bool = False) -> InlineKeyboardMarkup:
     if has_menu:
         rows.append([InlineKeyboardButton(text="🛒 Добавить продукты в покупки", callback_data="week:shopping")])
         rows.append([InlineKeyboardButton(text="🔄 Составить заново", callback_data="week:generate")])
+        rows.append([InlineKeyboardButton(text="🧹 Очистить меню", callback_data="week:clear")])
     else:
         rows.append([InlineKeyboardButton(text="📅 Составить меню на неделю", callback_data="week:generate")])
     rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")])
@@ -1497,6 +1502,17 @@ async def week_generate_callback(callback: CallbackQuery):
 async def week_shopping_callback(callback: CallbackQuery):
     added = add_weekly_menu_to_shopping(callback.from_user.id)
     await callback.answer(f"Добавлено продуктов: {added} 🛒")
+
+
+@dp.callback_query(F.data == "week:clear")
+async def week_clear_callback(callback: CallbackQuery):
+    clear_weekly_menu(callback.from_user.id)
+    await callback.message.edit_text(
+        format_weekly_menu({}),
+        reply_markup=weekly_menu_keyboard(False),
+        parse_mode="HTML",
+    )
+    await callback.answer("Меню очищено")
 
 
 @dp.callback_query(F.data == "history:clear")
