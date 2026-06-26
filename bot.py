@@ -1134,6 +1134,44 @@ def clear_weekly_menu(user_id: int) -> None:
     set_user_flag(user_id, "weekly_menu_ids", "")
 
 
+def save_weekly_menu(user_id: int, menu: dict[str, list[dict[str, Any]]]) -> None:
+    set_user_flag(
+        user_id,
+        "weekly_menu_ids",
+        json.dumps({day: [int(r["id"]) for r in items] for day, items in menu.items()}, ensure_ascii=False),
+    )
+
+
+def replace_weekly_menu_item(user_id: int, day_index: int, slot_index: int) -> dict[str, Any] | None:
+    menu = get_saved_weekly_menu(user_id)
+    if not menu or day_index < 0 or day_index >= len(WEEK_DAYS):
+        return None
+
+    day = WEEK_DAYS[day_index]
+    items = menu.get(day, [])
+    if slot_index < 0 or slot_index >= len(items):
+        return None
+
+    category = str(items[slot_index].get("category") or ["breakfast", "lunch", "dinner"][min(slot_index, 2)])
+    current_id = int(items[slot_index].get("id", 0) or 0)
+
+    used_ids: set[int] = set()
+    for day_items in menu.values():
+        for recipe in day_items:
+            recipe_id = int(recipe.get("id", 0) or 0)
+            if recipe_id and recipe_id != current_id:
+                used_ids.add(recipe_id)
+
+    new_recipe = pick_week_recipe(category, user_id, used_ids)
+    if not new_recipe:
+        return None
+
+    items[slot_index] = new_recipe
+    menu[day] = items
+    save_weekly_menu(user_id, menu)
+    return new_recipe
+
+
 def format_weekly_menu(menu: dict[str, list[dict[str, Any]]]) -> str:
     if not menu:
         return (
@@ -1158,11 +1196,35 @@ def weekly_menu_keyboard(has_menu: bool = False) -> InlineKeyboardMarkup:
     rows = []
     if has_menu:
         rows.append([InlineKeyboardButton(text="🛒 Добавить продукты в покупки", callback_data="week:shopping")])
+        rows.append([InlineKeyboardButton(text="🔄 Заменить одно блюдо", callback_data="week:replace_menu")])
         rows.append([InlineKeyboardButton(text="🔄 Составить заново", callback_data="week:generate")])
         rows.append([InlineKeyboardButton(text="🧹 Очистить меню", callback_data="week:clear")])
     else:
         rows.append([InlineKeyboardButton(text="📅 Составить меню на неделю", callback_data="week:generate")])
     rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def week_replace_menu_keyboard(menu: dict[str, list[dict[str, Any]]]) -> InlineKeyboardMarkup:
+    rows = []
+    day_short = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    meal_icons = ["🍳", "🍲", "🍽"]
+    meal_names = ["завтрак", "обед", "ужин"]
+
+    for day_index, day in enumerate(WEEK_DAYS):
+        items = menu.get(day, [])
+        for slot_index, recipe in enumerate(items):
+            icon = meal_icons[slot_index] if slot_index < len(meal_icons) else "🍽"
+            meal = meal_names[slot_index] if slot_index < len(meal_names) else "блюдо"
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"{day_short[day_index]} {icon} {meal}: {recipe['name'][:28]}",
+                    callback_data=f"week:replace:{day_index}:{slot_index}",
+                )
+            ])
+
+    rows.append([InlineKeyboardButton(text="⬅️ К меню недели", callback_data="settings:weekly")])
     rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1502,6 +1564,44 @@ async def week_generate_callback(callback: CallbackQuery):
 async def week_shopping_callback(callback: CallbackQuery):
     added = add_weekly_menu_to_shopping(callback.from_user.id)
     await callback.answer(f"Добавлено продуктов: {added} 🛒")
+
+
+@dp.callback_query(F.data == "week:replace_menu")
+async def week_replace_menu_callback(callback: CallbackQuery):
+    menu = get_saved_weekly_menu(callback.from_user.id)
+    if not menu:
+        await callback.answer("Сначала составь меню недели", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🔄 <b>Заменить блюдо</b>\n\nВыбери конкретный приём пищи, который нужно заменить.",
+        reply_markup=week_replace_menu_keyboard(menu),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("week:replace:"))
+async def week_replace_item_callback(callback: CallbackQuery):
+    try:
+        _, _, day_raw, slot_raw = str(callback.data).split(":")
+        day_index = int(day_raw)
+        slot_index = int(slot_raw)
+    except (ValueError, AttributeError):
+        await callback.answer("Не получилось заменить блюдо", show_alert=True)
+        return
+
+    new_recipe = replace_weekly_menu_item(callback.from_user.id, day_index, slot_index)
+    if not new_recipe:
+        await callback.answer("Не нашёл замену", show_alert=True)
+        return
+
+    menu = get_saved_weekly_menu(callback.from_user.id)
+    await callback.message.edit_text(
+        format_weekly_menu(menu),
+        reply_markup=weekly_menu_keyboard(True),
+        parse_mode="HTML",
+    )
+    await callback.answer(f"Заменил на: {new_recipe['name']}")
 
 
 @dp.callback_query(F.data == "week:clear")
