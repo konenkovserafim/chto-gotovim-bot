@@ -869,6 +869,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⏰ Время обеда", callback_data="settings:lunch_time")],
             [InlineKeyboardButton(text="⏰ Время ужина", callback_data="settings:dinner_time")],
             [InlineKeyboardButton(text="👥 Профили", callback_data="settings:profiles")],
+            [InlineKeyboardButton(text="📖 История приготовлений", callback_data="settings:history")],
             [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="history:clear")],
             [InlineKeyboardButton(text="ℹ️ О боте", callback_data="settings:about")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
