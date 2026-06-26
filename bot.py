@@ -1249,19 +1249,89 @@ def week_replace_menu_keyboard(menu: dict[str, list[dict[str, Any]]]) -> InlineK
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _normalize_ingredient_name(name: str) -> str:
+    return " ".join(name.lower().replace("ё", "е").split())
+
+
+def _parse_ingredient_amount(text: str) -> tuple[str, float | None, str | None]:
+    """Пытается разобрать строку ингредиента вида 'Курица — 300 г'."""
+    text = str(text).strip()
+    if not text:
+        return "", None, None
+
+    if "—" in text:
+        name, amount_text = text.split("—", 1)
+    elif " - " in text:
+        name, amount_text = text.split(" - ", 1)
+    else:
+        return text, None, None
+
+    name = name.strip()
+    amount_text = amount_text.strip()
+    match = re.search(r"(\d+(?:[,.]\d+)?)\s*([а-яА-Яa-zA-Z.]+)", amount_text)
+    if not match:
+        return name, None, None
+
+    try:
+        amount = float(match.group(1).replace(",", "."))
+    except ValueError:
+        return name, None, None
+
+    unit = match.group(2).strip().lower().replace(".", "")
+    return name, amount, unit
+
+
+def _format_amount(value: float, unit: str) -> str:
+    if abs(value - round(value)) < 0.05:
+        return f"{int(round(value))} {unit}"
+    return f"{value:.1f}".rstrip("0").rstrip(".") + f" {unit}"
+
+
+def merge_ingredient_lines(ingredients: list[str]) -> list[str]:
+    """Объединяет одинаковые продукты для списка покупок."""
+    totals: dict[tuple[str, str], dict[str, Any]] = {}
+    plain: dict[str, str] = {}
+
+    for raw in ingredients:
+        text = str(raw).strip()
+        if not text:
+            continue
+
+        name, amount, unit = _parse_ingredient_amount(text)
+        norm_name = _normalize_ingredient_name(name)
+
+        if amount is not None and unit:
+            key = (norm_name, unit)
+            if key not in totals:
+                totals[key] = {"name": name.strip(), "amount": 0.0, "unit": unit}
+            totals[key]["amount"] += amount
+        else:
+            plain.setdefault(norm_name, text)
+
+    result: list[str] = []
+    for item in totals.values():
+        result.append(f"{item['name']} — {_format_amount(float(item['amount']), str(item['unit']))}")
+
+    measured_names = {key[0] for key in totals.keys()}
+    for norm_name, text in plain.items():
+        if norm_name not in measured_names:
+            result.append(text)
+
+    return sorted(result, key=lambda x: x.lower())
+
+
 def add_weekly_menu_to_shopping(user_id: int) -> int:
     menu = get_saved_weekly_menu(user_id)
-    added = 0
-    seen: set[str] = set()
+    all_ingredients: list[str] = []
     for items in menu.values():
         for recipe in items:
-            for ingredient in recipe.get("ingredients", []):
-                ingredient = str(ingredient).strip()
-                if not ingredient or ingredient in seen:
-                    continue
-                seen.add(ingredient)
-                if add_shopping_item_db(user_id, ingredient):
-                    added += 1
+            all_ingredients.extend(str(i).strip() for i in recipe.get("ingredients", []) if str(i).strip())
+
+    merged_ingredients = merge_ingredient_lines(all_ingredients)
+    added = 0
+    for ingredient in merged_ingredients:
+        if add_shopping_item_db(user_id, ingredient):
+            added += 1
     return added
 
 
