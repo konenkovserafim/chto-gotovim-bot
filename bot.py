@@ -1249,25 +1249,103 @@ def week_replace_menu_keyboard(menu: dict[str, list[dict[str, Any]]]) -> InlineK
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def add_weekly_menu_to_shopping(user_id: int) -> int:
-    """Добавляет ингредиенты из текущего меню недели в список покупок.
+def parse_ingredient_line(line: str) -> tuple[str, float, str] | None:
+    """Пробует разобрать строку ингредиента вида "Молоко — 400 мл".
 
-    Важно: в recipes.json ингредиенты сейчас хранятся обычными строками
-    вроде "Молоко — 400 мл", поэтому в этой версии мы ничего не
-    суммируем и не разбираем. Просто добавляем все строки ингредиентов.
-    Объединение одинаковых продуктов сделаем отдельным безопасным шагом.
+    Возвращает: (название, количество, единица).
+    Если формат сложный или количество не число — возвращает None.
     """
-    menu = get_saved_weekly_menu(user_id)
-    added = 0
+    text = str(line).strip()
+    if not text:
+        return None
+
+    if "—" in text:
+        name, amount_part = text.split("—", 1)
+    elif "-" in text:
+        name, amount_part = text.split("-", 1)
+    else:
+        return None
+
+    name = name.strip()
+    amount_part = amount_part.strip()
+    if not name or not amount_part:
+        return None
+
+    pieces = amount_part.split()
+    if not pieces:
+        return None
+
+    raw_amount = pieces[0].replace(",", ".")
+    try:
+        amount = float(raw_amount)
+    except ValueError:
+        return None
+
+    unit = " ".join(pieces[1:]).strip()
+    if not unit:
+        unit = "шт."
+
+    return name, amount, unit
+
+
+def format_amount(amount: float) -> str:
+    if amount.is_integer():
+        return str(int(amount))
+    return str(round(amount, 2)).replace(".", ",")
+
+
+def build_weekly_shopping_items(menu: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """Собирает продукты из меню недели и аккуратно объединяет одинаковые.
+
+    Объединяем только безопасные случаи: одинаковое название + одинаковая единица.
+    Если строку нельзя разобрать, добавляем её как есть и убираем точные дубли.
+    """
+    totals: dict[tuple[str, str], dict[str, Any]] = {}
+    raw_items: list[str] = []
 
     for items in menu.values():
         for recipe in items:
             for ingredient in recipe.get("ingredients", []):
-                ingredient = str(ingredient).strip()
-                if not ingredient:
+                text = str(ingredient).strip()
+                if not text:
                     continue
-                if add_shopping_item_db(user_id, ingredient):
-                    added += 1
+
+                parsed = parse_ingredient_line(text)
+                if not parsed:
+                    raw_items.append(text)
+                    continue
+
+                name, amount, unit = parsed
+                key = (name.lower(), unit.lower())
+                if key not in totals:
+                    totals[key] = {"name": name, "amount": 0.0, "unit": unit}
+                totals[key]["amount"] += amount
+
+    result = [
+        f"{item['name']} — {format_amount(item['amount'])} {item['unit']}"
+        for item in totals.values()
+    ]
+
+    # Добавляем неразобранные строки без точных дублей
+    seen = {item.lower() for item in result}
+    for item in raw_items:
+        key = item.lower()
+        if key not in seen:
+            result.append(item)
+            seen.add(key)
+
+    return sorted(result, key=str.lower)
+
+
+def add_weekly_menu_to_shopping(user_id: int) -> int:
+    """Добавляет объединённые ингредиенты из текущего меню недели в покупки."""
+    menu = get_saved_weekly_menu(user_id)
+    shopping_items = build_weekly_shopping_items(menu)
+    added = 0
+
+    for item in shopping_items:
+        if add_shopping_item_db(user_id, item):
+            added += 1
 
     return added
 
