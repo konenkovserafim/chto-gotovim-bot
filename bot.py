@@ -2190,22 +2190,130 @@ def home_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+
+def _split_profile_terms(value: str | None) -> list[str]:
+    """Разбирает предпочтения/ограничения профиля: строки через запятую или JSON-список."""
+    if not value:
+        return []
+    text = str(value).strip()
+    items: list[str] = []
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            items = [str(x) for x in data]
+        else:
+            items = [text]
+    except Exception:
+        items = text.replace(";", ",").split(",")
+
+    result: list[str] = []
+    for item in items:
+        term = str(item).strip().lower()
+        if not term:
+            continue
+        # Убираем совсем служебные слова, но не трогаем нормальные названия продуктов.
+        term = term.replace("ё", "е")
+        if term not in result:
+            result.append(term)
+    return result
+
+
+def _recipe_text_for_matching(recipe: dict[str, Any]) -> str:
+    parts: list[str] = [
+        str(recipe.get("name", "")),
+        str(recipe.get("category", "")),
+    ]
+    for key in ("ingredients", "steps", "tags"):
+        value = recipe.get(key, [])
+        if isinstance(value, list):
+            parts.extend(str(x) for x in value)
+        else:
+            parts.append(str(value))
+    return " ".join(parts).lower().replace("ё", "е")
+
+
+def _matched_terms(recipe: dict[str, Any], terms: list[str]) -> list[str]:
+    text = _recipe_text_for_matching(recipe)
+    matched: list[str] = []
+    for term in terms:
+        normalized = term.lower().replace("ё", "е").strip()
+        if normalized and normalized in text and term not in matched:
+            matched.append(term)
+    return matched
+
+
+def _active_family_summary(user_id: int) -> tuple[list[dict[str, Any]], str]:
+    profiles = family_active_profiles(user_id)
+    if not profiles:
+        return [], ""
+    names = ", ".join(str(p.get("name", "")) for p in profiles if p.get("name"))
+    return profiles, names
+
+
 def recommend_recipe(user_id: int, exclude_recipe_id: int | None = None) -> tuple[dict[str, Any], list[str]]:
     target_category = current_meal_category()
     selected = set(get_fridge_items(user_id))
     favorites = set(get_favorites(user_id))
-    recent = get_recent_cooked_recipe_ids(user_id, limit=5)
+    history_limit = 8 if family_consider_enabled(user_id, "history") else 5
+    recent = get_recent_cooked_recipe_ids(user_id, limit=history_limit)
     ratings = get_user_ratings(user_id)
     candidates = recipes_for_category(target_category) or RECIPES
 
+    active_profiles, active_names = _active_family_summary(user_id)
+    consider_prefs = family_consider_enabled(user_id, "prefs")
+    consider_limits = family_consider_enabled(user_id, "limits")
+    consider_goals = family_consider_enabled(user_id, "goals")
+    consider_history = family_consider_enabled(user_id, "history")
+
+    preference_terms: list[str] = []
+    restriction_terms: list[str] = []
+    goals: list[str] = []
+    for profile in active_profiles:
+        if consider_prefs:
+            preference_terms.extend(_split_profile_terms(profile.get("preferences")))
+        if consider_limits:
+            restriction_terms.extend(_split_profile_terms(profile.get("restrictions")))
+        if consider_goals:
+            goal = str(profile.get("goal") or "").strip().lower()
+            if goal and goal not in goals:
+                goals.append(goal)
+
+    # Убираем дубли, сохраняя порядок.
+    preference_terms = list(dict.fromkeys(preference_terms))
+    restriction_terms = list(dict.fromkeys(restriction_terms))
+
+    allowed_candidates: list[dict[str, Any]] = []
+    blocked_examples: list[str] = []
+    if restriction_terms:
+        for recipe in candidates:
+            blocked = _matched_terms(recipe, restriction_terms)
+            if blocked:
+                if len(blocked_examples) < 3:
+                    blocked_examples.append(f"{recipe.get('name', 'блюдо')} ({', '.join(blocked[:2])})")
+                continue
+            allowed_candidates.append(recipe)
+    else:
+        allowed_candidates = list(candidates)
+
+    # Если ограничения отфильтровали всё, не оставляем пользователя без рекомендации.
+    if not allowed_candidates:
+        allowed_candidates = list(candidates)
+
     scored = []
-    for recipe in candidates:
+    for recipe in allowed_candidates:
         recipe_id = int(recipe.get("id", 0))
         score = 0
-        reasons = []
+        reasons: list[str] = []
 
-        if exclude_recipe_id and recipe_id == exclude_recipe_id and len(candidates) > 1:
+        if exclude_recipe_id and recipe_id == exclude_recipe_id and len(allowed_candidates) > 1:
             score -= 1000
+
+        if active_profiles:
+            if active_names:
+                reasons.append(f"👨‍👩‍👧 Подбираю для: {active_names}.")
+            if restriction_terms and not _matched_terms(recipe, restriction_terms):
+                score += 35
+                reasons.append("🚫 Не содержит исключённые продукты.")
 
         required = detected_product_codes(recipe)
         matched = required & selected
@@ -2222,6 +2330,30 @@ def recommend_recipe(user_id: int, exclude_recipe_id: int | None = None) -> tupl
                     reasons.append(f"🛒 Не хватает только: {missing_titles}.")
             elif matched:
                 score += 10
+                reasons.append("🥶 Часть продуктов уже есть в холодильнике.")
+
+        matched_prefs = _matched_terms(recipe, preference_terms)
+        if matched_prefs:
+            score += min(30, 10 + len(matched_prefs) * 5)
+            reasons.append(f"❤️ Совпадает с предпочтениями: {', '.join(matched_prefs[:3])}.")
+
+        calories = int(recipe.get("calories", 0) or 0)
+        goal_reasons: list[str] = []
+        for goal in goals:
+            if "похуд" in goal:
+                if calories and calories <= 700:
+                    score += 18
+                    goal_reasons.append("🎯 подходит для более лёгкого рациона")
+                elif calories and calories >= 1000:
+                    score -= 18
+            elif "набор" in goal or "мас" in goal:
+                if calories and calories >= 700:
+                    score += 12
+                    goal_reasons.append("🎯 достаточно сытное блюдо")
+            elif "поддерж" in goal:
+                score += 4
+        if goal_reasons:
+            reasons.append(goal_reasons[0] + ".")
 
         if recipe_id in favorites:
             score += 20
@@ -2232,9 +2364,13 @@ def recommend_recipe(user_id: int, exclude_recipe_id: int | None = None) -> tupl
             score += rating * 4
             if rating >= 4:
                 reasons.append(f"⭐ Вы оценили это блюдо на {rating}/5.")
+            elif rating <= 2:
+                score -= 10
 
-        if recipe_id in recent:
-            score -= 25
+        if consider_history and recipe_id in recent:
+            score -= 35
+        elif recipe_id in recent:
+            score -= 20
         elif get_cooked_count(user_id) > 0:
             score += 8
             reasons.append("📖 Давно не появлялось в истории.")
@@ -2249,13 +2385,18 @@ def recommend_recipe(user_id: int, exclude_recipe_id: int | None = None) -> tupl
         if not reasons:
             reasons.append("🍽 Подходит под текущее время дня.")
 
-        scored.append((score, random.random(), recipe, reasons))
+        # Убираем повторяющиеся причины.
+        unique_reasons: list[str] = []
+        for reason in reasons:
+            if reason not in unique_reasons:
+                unique_reasons.append(reason)
+
+        scored.append((score, random.random(), recipe, unique_reasons))
 
     scored.sort(key=lambda item: (-item[0], item[1]))
     _, _, recipe, reasons = scored[0]
     set_user_flag(user_id, "last_recommendation_id", str(recipe["id"]))
-    return recipe, reasons[:4]
-
+    return recipe, reasons[:6]
 
 def format_recommendation(recipe: dict[str, Any], reasons: list[str]) -> str:
     lines = [
