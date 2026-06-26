@@ -192,6 +192,23 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, profile_code)
             )
         """)
+        # Миграция профилей: старые базы создавались с минимальным набором полей.
+        # Добавляем новые поля мягко, чтобы существующие профили не сломались.
+        existing_profile_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(household_profiles)").fetchall()
+        }
+        profile_columns_to_add = {
+            "age": "INTEGER",
+            "height": "INTEGER",
+            "weight": "REAL",
+            "gender": "TEXT",
+            "preferences": "TEXT",
+            "restrictions": "TEXT",
+        }
+        for column_name, column_type in profile_columns_to_add.items():
+            if column_name not in existing_profile_columns:
+                conn.execute(f"ALTER TABLE household_profiles ADD COLUMN {column_name} {column_type}")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_flags (
                 user_id INTEGER NOT NULL,
@@ -664,48 +681,99 @@ def get_user_ratings(user_id: int) -> dict[int, int]:
     return {int(row["recipe_id"]): int(row["rating"]) for row in rows}
 
 
-DEFAULT_PROFILES = [
-    {
-        "code": "serafim",
-        "name": "Серафим",
-        "goal": "сытная порция / поддержание",
-        "calories": 2600,
-        "factor": 0.60,
-        "notes": "порция побольше",
-    },
-    {
-        "code": "tanya",
-        "name": "Таня",
-        "goal": "полегче / похудение",
-        "calories": 1700,
-        "factor": 0.40,
-        "notes": "порция поменьше, без свинины в будущих подборках",
-    },
-]
-
-
-def ensure_profiles(user_id: int) -> None:
+def delete_user_flag(user_id: int, key: str) -> None:
     with db_connect() as conn:
-        for p in DEFAULT_PROFILES:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO household_profiles
-                (user_id, profile_code, name, goal, calories, portion_factor, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (user_id, p["code"], p["name"], p["goal"], p["calories"], p["factor"], p["notes"]),
-            )
+        conn.execute(
+            "DELETE FROM user_flags WHERE user_id = ? AND key = ?",
+            (user_id, key),
+        )
         conn.commit()
 
 
+def reset_old_default_profiles_once(user_id: int) -> None:
+    """Один раз убирает старые автоматические профили из предыдущей версии.
+
+    Новая логика: профили изначально пустые, пользователь сам создаёт людей.
+    """
+    if get_user_flag(user_id, "profiles_empty_migration_v1") == "1":
+        return
+    with db_connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM household_profiles
+            WHERE user_id = ?
+              AND profile_code IN ('serafim', 'tanya')
+              AND name IN ('Серафим', 'Таня')
+            """,
+            (user_id,),
+        )
+        conn.commit()
+    set_user_flag(user_id, "profiles_empty_migration_v1", "1")
+
+
 def get_profiles(user_id: int) -> list[dict[str, Any]]:
-    ensure_profiles(user_id)
+    reset_old_default_profiles_once(user_id)
     with db_connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM household_profiles WHERE user_id = ? ORDER BY CASE profile_code WHEN 'serafim' THEN 1 WHEN 'tanya' THEN 2 ELSE 3 END",
+            "SELECT * FROM household_profiles WHERE user_id = ? ORDER BY name COLLATE NOCASE",
             (user_id,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_profile(user_id: int, profile_code: str) -> dict[str, Any] | None:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM household_profiles WHERE user_id = ? AND profile_code = ?",
+            (user_id, profile_code),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def add_profile_db(user_id: int, name: str) -> str:
+    code = f"profile_{int(datetime.now().timestamp())}_{random.randint(100, 999)}"
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO household_profiles
+            (user_id, profile_code, name, goal, calories, portion_factor, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, code, name, "не указана", 0, 1.0, ""),
+        )
+        conn.commit()
+    return code
+
+
+def delete_profile_db(user_id: int, profile_code: str) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            "DELETE FROM household_profiles WHERE user_id = ? AND profile_code = ?",
+            (user_id, profile_code),
+        )
+        conn.commit()
+
+
+def update_profile_field_db(user_id: int, profile_code: str, field: str, value: Any) -> None:
+    allowed_fields = {
+        "name", "goal", "calories", "portion_factor", "notes",
+        "age", "height", "weight", "gender", "preferences", "restrictions",
+    }
+    if field not in allowed_fields:
+        raise ValueError(f"Unknown profile field: {field}")
+    with db_connect() as conn:
+        conn.execute(
+            f"UPDATE household_profiles SET {field} = ? WHERE user_id = ? AND profile_code = ?",
+            (value, user_id, profile_code),
+        )
+        conn.commit()
+
+
+def clean_profile_value(value: Any, empty_text: str = "не указано") -> str:
+    if value is None:
+        return empty_text
+    text = str(value).strip()
+    return text if text else empty_text
 
 
 init_db()
@@ -749,7 +817,6 @@ def recipe_list_keyboard(category: str, page: int = 0) -> InlineKeyboardMarkup:
         rows.append(nav)
 
     rows.append([InlineKeyboardButton(text="🎲 Случайное из раздела", callback_data=f"randomcat:{category}")])
-    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -794,20 +861,13 @@ def favorites_keyboard(fav_ids: list[int]) -> InlineKeyboardMarkup:
         if recipe:
             rows.append([InlineKeyboardButton(text=recipe["name"], callback_data=f"favrecipe:{recipe_id}")])
     rows.append([InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")])
-    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def clear_keyboard(kind: str) -> InlineKeyboardMarkup:
     if kind == "favorites":
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")],
-            [InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")],
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear:shopping")],
-        [InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")],
-    ])
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить избранное", callback_data="clear:favorites")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Очистить список", callback_data="clear:shopping")]])
 
 
 
@@ -818,7 +878,6 @@ def product_category_keyboard(selected_codes: list[str]) -> InlineKeyboardMarkup
         rows.append([InlineKeyboardButton(text=group["title"], callback_data=f"fridge:category:{key}")])
     rows.append([InlineKeyboardButton(text="🔎 Найти блюда", callback_data="fridge:find")])
     rows.append([InlineKeyboardButton(text="🧹 Очистить холодильник", callback_data="fridge:clear")])
-    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -915,7 +974,6 @@ def fridge_results_keyboard(results: dict[str, list[tuple[dict[str, Any], set[st
         rows.append([InlineKeyboardButton(text=f"🟡 {recipe['name']} · не хватает: {missing_titles}", callback_data=f"recipe:{recipe['id']}:{recipe.get('category', 'lunch')}:0")])
         shown += 1
     rows.append([InlineKeyboardButton(text="⬅️ К холодильнику", callback_data="fridge:back")])
-    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -947,8 +1005,6 @@ FILTERS = {
 
 def filter_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=data["title"], callback_data=f"filter:{key}:0")] for key, data in FILTERS.items()]
-    rows.append([InlineKeyboardButton(text="⬅️ К поиску", callback_data="search:new")])
-    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -999,8 +1055,6 @@ def filter_results_keyboard(kind: str, page: int = 0) -> InlineKeyboardMarkup:
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="⚙️ Все фильтры", callback_data="filters:menu")])
-    rows.append([InlineKeyboardButton(text="⬅️ К поиску", callback_data="search:new")])
-    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1039,7 +1093,6 @@ def about_text(user_id: int) -> str:
 def about_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
         ]
     )
@@ -1126,7 +1179,6 @@ def search_results_keyboard(query: str, page: int = 0) -> InlineKeyboardMarkup:
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search:new")])
-    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1172,20 +1224,333 @@ def scale_ingredient_text(item: str, factor: float) -> str:
     return f"{name} — {new_amount}"
 
 
-def format_profile_summary(user_id: int) -> str:
+def format_profiles_text(user_id: int) -> str:
     profiles = get_profiles(user_id)
-    lines = ["👥 <b>Профили</b>", "", "Пока стоят базовые настройки. Потом добавим редактирование прямо в боте.", ""]
+    if not profiles:
+        return (
+            "👥 <b>Профили</b>\n\n"
+            "Пока здесь пусто.\n\n"
+            "Создайте первый профиль, чтобы бот мог учитывать предпочтения каждого."
+        )
+    lines = ["👥 <b>Профили</b>", ""]
     for p in profiles:
-        icon = "👨" if p["profile_code"] == "serafim" else "👩"
-        percent = int(round(float(p["portion_factor"]) * 100))
-        lines.append(f"{icon} <b>{p['name']}</b>")
-        lines.append(f"• Цель: {p['goal']}")
-        lines.append(f"• Дневная норма: ~{p['calories']} ккал")
-        lines.append(f"• Доля порции: ~{percent}%")
-        if p.get("notes"):
-            lines.append(f"• Заметка: {p['notes']}")
-        lines.append("")
+        lines.append(f"👤 <b>{p['name']}</b>")
+    lines.append("")
+    lines.append("Можно добавить ещё профиль или открыть семейные настройки.")
     return "\n".join(lines).strip()
+
+
+def profiles_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    profiles = get_profiles(user_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in profiles:
+        rows.append([InlineKeyboardButton(text=f"👤 {p['name']}", callback_data=f"profiles:view:{p['profile_code']}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить профиль", callback_data="profiles:add")])
+    rows.append([InlineKeyboardButton(text="👨‍👩‍👧 Семья", callback_data="profiles:family")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def profile_detail_text(profile: dict[str, Any]) -> str:
+    goal = clean_profile_value(profile.get("goal"), "не указана")
+    calories = int(profile.get("calories") or 0)
+    calories_text = f"~{calories} ккал" if calories else "не указана"
+    age = clean_profile_value(profile.get("age"))
+    height = clean_profile_value(profile.get("height"))
+    weight_raw = profile.get("weight")
+    weight = clean_profile_value(weight_raw)
+    gender = clean_profile_value(profile.get("gender"))
+    preferences = clean_profile_value(profile.get("preferences"), "не заполнено")
+    restrictions = clean_profile_value(profile.get("restrictions"), "не заполнено")
+
+    return (
+        f"👤 <b>{profile['name']}</b>\n\n"
+        f"📝 <b>Данные</b>\n"
+        f"Возраст: <b>{age}</b>\n"
+        f"Рост: <b>{height}</b>\n"
+        f"Вес: <b>{weight}</b>\n"
+        f"Пол: <b>{gender}</b>\n\n"
+        f"🎯 Цель: <b>{goal}</b>\n"
+        f"🔥 Норма: <b>{calories_text}</b>\n\n"
+        f"❤️ Предпочтения: <b>{preferences}</b>\n"
+        f"🚫 Ограничения: <b>{restrictions}</b>\n\n"
+        "Выберите, что хотите изменить."
+    )
+
+
+def profile_detail_keyboard(profile_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить имя", callback_data=f"profiles:edit:name:{profile_code}")],
+            [InlineKeyboardButton(text="📝 Данные", callback_data=f"profiles:data:{profile_code}")],
+            [InlineKeyboardButton(text="❤️ Предпочтения", callback_data=f"profiles:prefs:{profile_code}")],
+            [InlineKeyboardButton(text="🚫 Ограничения", callback_data=f"profiles:limits:{profile_code}")],
+            [InlineKeyboardButton(text="🎯 Цель", callback_data=f"profiles:goal:{profile_code}")],
+            [InlineKeyboardButton(text="🗑 Удалить профиль", callback_data=f"profiles:delete_confirm:{profile_code}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="profiles:list")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
+    )
+
+
+def profile_section_text(profile: dict[str, Any], section: str) -> str:
+    if section == "data":
+        return (
+            f"📝 <b>Данные</b>\n\n"
+            f"👤 <b>{profile['name']}</b>\n\n"
+            f"Возраст: <b>{clean_profile_value(profile.get('age'))}</b>\n"
+            f"Рост: <b>{clean_profile_value(profile.get('height'))}</b>\n"
+            f"Вес: <b>{clean_profile_value(profile.get('weight'))}</b>\n"
+            f"Пол: <b>{clean_profile_value(profile.get('gender'))}</b>\n\n"
+            "Выберите, что изменить."
+        )
+    if section == "prefs":
+        return (
+            f"❤️ <b>Предпочтения</b>\n\n"
+            f"👤 <b>{profile['name']}</b>\n\n"
+            f"{clean_profile_value(profile.get('preferences'), 'Пока не заполнено.')}\n\n"
+            "Например: курица, сырники, итальянская кухня, паста."
+        )
+    if section == "limits":
+        return (
+            f"🚫 <b>Ограничения</b>\n\n"
+            f"👤 <b>{profile['name']}</b>\n\n"
+            f"{clean_profile_value(profile.get('restrictions'), 'Пока не заполнено.')}\n\n"
+            "Например: свинина, грибы, морепродукты, острое."
+        )
+    if section == "goal":
+        return (
+            f"🎯 <b>Цель</b>\n\n"
+            f"👤 <b>{profile['name']}</b>\n\n"
+            f"Сейчас: <b>{clean_profile_value(profile.get('goal'), 'не указана')}</b>\n"
+            f"Норма калорий: <b>{int(profile.get('calories') or 0) or 'не указана'}</b>\n\n"
+            "Выберите цель или настройте калории."
+        )
+    return "Раздел профиля."
+
+
+def profile_section_keyboard(profile_code: str, section: str = "data") -> InlineKeyboardMarkup:
+    if section == "data":
+        rows = [
+            [InlineKeyboardButton(text="🎂 Возраст", callback_data=f"profiles:edit:age:{profile_code}")],
+            [InlineKeyboardButton(text="📏 Рост", callback_data=f"profiles:edit:height:{profile_code}")],
+            [InlineKeyboardButton(text="⚖️ Вес", callback_data=f"profiles:edit:weight:{profile_code}")],
+            [InlineKeyboardButton(text="🚻 Пол", callback_data=f"profiles:gender:{profile_code}")],
+        ]
+    elif section == "prefs":
+        rows = [
+            [InlineKeyboardButton(text="✏️ Изменить предпочтения", callback_data=f"profiles:edit:preferences:{profile_code}")],
+            [InlineKeyboardButton(text="🧹 Очистить", callback_data=f"profiles:clear:preferences:{profile_code}")],
+        ]
+    elif section == "limits":
+        rows = [
+            [InlineKeyboardButton(text="✏️ Изменить ограничения", callback_data=f"profiles:edit:restrictions:{profile_code}")],
+            [InlineKeyboardButton(text="🧹 Очистить", callback_data=f"profiles:clear:restrictions:{profile_code}")],
+        ]
+    elif section == "goal":
+        rows = [
+            [InlineKeyboardButton(text="⚖️ Поддержание", callback_data=f"profiles:setgoal:Поддержание:{profile_code}")],
+            [InlineKeyboardButton(text="📉 Похудение", callback_data=f"profiles:setgoal:Похудение:{profile_code}")],
+            [InlineKeyboardButton(text="📈 Набор массы", callback_data=f"profiles:setgoal:Набор массы:{profile_code}")],
+            [InlineKeyboardButton(text="🔥 Норма калорий", callback_data=f"profiles:edit:calories:{profile_code}")],
+        ]
+    else:
+        rows = []
+    rows.append([InlineKeyboardButton(text="⬅️ К профилю", callback_data=f"profiles:view:{profile_code}")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def profile_gender_keyboard(profile_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👨 Мужской", callback_data=f"profiles:setgender:Мужской:{profile_code}")],
+            [InlineKeyboardButton(text="👩 Женский", callback_data=f"profiles:setgender:Женский:{profile_code}")],
+            [InlineKeyboardButton(text="⬅️ К данным", callback_data=f"profiles:data:{profile_code}")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
+    )
+
+
+def profile_edit_prompt(field: str, profile: dict[str, Any]) -> str:
+    prompts = {
+        "name": "Введите новое имя профиля.",
+        "age": "Введите возраст числом. Например: 26",
+        "height": "Введите рост в сантиметрах. Например: 180",
+        "weight": "Введите вес в килограммах. Например: 86",
+        "calories": "Введите дневную норму калорий. Например: 2500",
+        "preferences": "Введите предпочтения через запятую. Например: курица, паста, сырники, итальянская кухня",
+        "restrictions": "Введите ограничения через запятую. Например: свинина, грибы, морепродукты",
+    }
+    current = clean_profile_value(profile.get(field), "не заполнено")
+    return (
+        f"✏️ <b>Редактирование</b>\n\n"
+        f"👤 <b>{profile['name']}</b>\n"
+        f"Текущее значение: <b>{current}</b>\n\n"
+        f"{prompts.get(field, 'Введите новое значение.')}"
+    )
+
+
+def profile_edit_cancel_keyboard(profile_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К профилю", callback_data=f"profiles:edit_cancel:{profile_code}")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
+    )
+
+
+
+def _load_json_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data]
+
+
+def family_mode(user_id: int) -> str:
+    mode = get_user_flag(user_id, "family_mode")
+    return mode if mode in {"all", "selected"} else "all"
+
+
+def set_family_mode(user_id: int, mode: str) -> None:
+    set_user_flag(user_id, "family_mode", mode if mode in {"all", "selected"} else "all")
+
+
+def family_selected_codes(user_id: int) -> list[str]:
+    return _load_json_list(get_user_flag(user_id, "family_selected_profiles"))
+
+
+def set_family_selected_codes(user_id: int, codes: list[str]) -> None:
+    unique_codes: list[str] = []
+    for code in codes:
+        if code and code not in unique_codes:
+            unique_codes.append(code)
+    set_user_flag(user_id, "family_selected_profiles", json.dumps(unique_codes, ensure_ascii=False))
+
+
+def family_consider_enabled(user_id: int, key: str) -> bool:
+    value = get_user_flag(user_id, f"family_consider_{key}")
+    return value != "0"
+
+
+def set_family_consider(user_id: int, key: str, enabled: bool) -> None:
+    set_user_flag(user_id, f"family_consider_{key}", "1" if enabled else "0")
+
+
+def family_active_profiles(user_id: int) -> list[dict[str, Any]]:
+    profiles = get_profiles(user_id)
+    if family_mode(user_id) == "all":
+        return profiles
+    selected = set(family_selected_codes(user_id))
+    return [profile for profile in profiles if profile.get("profile_code") in selected]
+
+
+def family_text(user_id: int) -> str:
+    profiles = get_profiles(user_id)
+    mode = family_mode(user_id)
+    active = family_active_profiles(user_id)
+    active_codes = {p.get("profile_code") for p in active}
+
+    lines = ["👨‍👩‍👧 <b>Семья</b>", ""]
+    if not profiles:
+        lines.append("Пока участников нет.")
+        lines.append("Добавьте первый профиль, чтобы бот понимал, для кого готовим.")
+        return "\n".join(lines).strip()
+
+    lines.append("<b>Участники:</b>")
+    for profile in profiles:
+        mark = "✅" if mode == "all" or profile.get("profile_code") in active_codes else "☐"
+        lines.append(f"{mark} {profile['name']}")
+
+    lines.append("")
+    lines.append("<b>🍽 Для кого готовим</b>")
+    if mode == "all":
+        lines.append("🟢 Для всех")
+    else:
+        if active:
+            names = ", ".join(p["name"] for p in active)
+            lines.append(f"🟢 Для выбранных: {names}")
+        else:
+            lines.append("🟡 Для выбранных: пока никто не выбран")
+
+    lines.append("")
+    lines.append("<b>🧠 При подборе учитывать</b>")
+    consider_labels = [
+        ("prefs", "Предпочтения"),
+        ("limits", "Ограничения"),
+        ("goals", "Цели"),
+        ("history", "Историю приготовлений"),
+    ]
+    for key, label in consider_labels:
+        mark = "✅" if family_consider_enabled(user_id, key) else "☐"
+        lines.append(f"{mark} {label}")
+
+    lines.append("")
+    active_count = len(active) if mode == "selected" else len(profiles)
+    lines.append(f"👥 Размер семьи для подбора: <b>{active_count}</b>")
+    return "\n".join(lines).strip()
+
+
+def family_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    mode = family_mode(user_id)
+    all_text = "✅ Для всех" if mode == "all" else "○ Для всех"
+    selected_text = "✅ Для выбранных" if mode == "selected" else "○ Для выбранных"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=all_text, callback_data="family:mode:all"),
+                InlineKeyboardButton(text=selected_text, callback_data="family:mode:selected"),
+            ],
+            [InlineKeyboardButton(text="👥 Выбрать участников", callback_data="family:select")],
+            [
+                InlineKeyboardButton(text=("✅ Предпочтения" if family_consider_enabled(user_id, "prefs") else "☐ Предпочтения"), callback_data="family:toggle:prefs"),
+                InlineKeyboardButton(text=("✅ Ограничения" if family_consider_enabled(user_id, "limits") else "☐ Ограничения"), callback_data="family:toggle:limits"),
+            ],
+            [
+                InlineKeyboardButton(text=("✅ Цели" if family_consider_enabled(user_id, "goals") else "☐ Цели"), callback_data="family:toggle:goals"),
+                InlineKeyboardButton(text=("✅ История" if family_consider_enabled(user_id, "history") else "☐ История"), callback_data="family:toggle:history"),
+            ],
+            [InlineKeyboardButton(text="➕ Добавить профиль", callback_data="profiles:add")],
+            [InlineKeyboardButton(text="✏️ Управление участниками", callback_data="profiles:list")],
+            [InlineKeyboardButton(text="⬅️ К профилям", callback_data="profiles:list")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]
+    )
+
+
+def family_select_text(user_id: int) -> str:
+    profiles = get_profiles(user_id)
+    selected = set(family_selected_codes(user_id))
+    lines = ["👥 <b>Для кого готовим?</b>", ""]
+    if not profiles:
+        lines.append("Профилей пока нет. Сначала добавьте участника.")
+        return "\n".join(lines).strip()
+    lines.append("Отметьте участников, для которых бот будет подбирать блюда.")
+    lines.append("")
+    for profile in profiles:
+        mark = "☑️" if profile.get("profile_code") in selected else "☐"
+        lines.append(f"{mark} {profile['name']}")
+    return "\n".join(lines).strip()
+
+
+def family_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    profiles = get_profiles(user_id)
+    selected = set(family_selected_codes(user_id))
+    rows: list[list[InlineKeyboardButton]] = []
+    for profile in profiles:
+        code = profile.get("profile_code")
+        mark = "☑️" if code in selected else "☐"
+        rows.append([InlineKeyboardButton(text=f"{mark} {profile['name']}", callback_data=f"family:select_toggle:{code}")])
+    rows.append([InlineKeyboardButton(text="💾 Сохранить", callback_data="family:select_save")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="profiles:family")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 
@@ -1365,7 +1730,7 @@ def weekly_menu_keyboard(has_menu: bool = False) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🧹 Очистить меню", callback_data="week:clear")])
     else:
         rows.append([InlineKeyboardButton(text="📅 Составить меню на неделю", callback_data="week:generate")])
-    rows.append([InlineKeyboardButton(text="⬅️ На главную", callback_data="home:main")])
+    rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings:menu")])
     rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1535,19 +1900,24 @@ def add_weekly_menu_to_shopping(user_id: int) -> int:
 
 def format_portions(recipe: dict[str, Any], user_id: int) -> str:
     profiles = get_profiles(user_id)
+    if not profiles:
+        return (
+            "👥 <b>Порции</b>\n\n"
+            "Профилей пока нет. Создайте профиль в разделе 👥 Профили, "
+            "и потом бот сможет учитывать участников семьи."
+        )
     total_cal = int(recipe.get("calories", 0) or 0)
-    lines = [f"👥 <b>Порции: {recipe['name']}</b>", "", "Расчёт примерный: рецепт делится между вами по долям.", ""]
+    lines = [f"👥 <b>Порции: {recipe['name']}</b>", "", "Расчёт примерный: рецепт делится между профилями по долям.", ""]
+    factor = 1 / max(len(profiles), 1)
     for p in profiles:
-        icon = "👨" if p["profile_code"] == "serafim" else "👩"
-        factor = float(p["portion_factor"])
         kcal = int(round(total_cal * factor)) if total_cal else 0
-        lines.append(f"{icon} <b>{p['name']}</b> — примерно {int(round(factor * 100))}%")
+        lines.append(f"👤 <b>{p['name']}</b> — примерно {int(round(factor * 100))}%")
         if kcal:
             lines.append(f"🔥 ~{kcal} ккал")
         for item in recipe.get("ingredients", [])[:12]:
             lines.append(f"• {scale_ingredient_text(item, factor)}")
         lines.append("")
-    lines.append("🛒 В список покупок всё равно добавляются общие ингредиенты на двоих.")
+    lines.append("🛒 В список покупок всё равно добавляются общие ингредиенты.")
     return "\n".join(lines)
 
 
@@ -2193,8 +2563,8 @@ async def history_clear_confirm_callback(callback: CallbackQuery):
 @dp.callback_query(F.data == "settings:profiles")
 async def settings_profiles_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        format_profile_summary(callback.from_user.id),
-        reply_markup=back_to_settings_keyboard(),
+        format_profiles_text(callback.from_user.id),
+        reply_markup=profiles_keyboard(callback.from_user.id),
         parse_mode="HTML",
     )
     await callback.answer()
@@ -2252,7 +2622,288 @@ async def filter_recipe_callback(callback: CallbackQuery):
 
 @dp.message(F.text == "👥 Профили")
 async def profiles_message(message: Message):
-    await message.answer(format_profile_summary(message.from_user.id), parse_mode="HTML")
+    await message.answer(
+        format_profiles_text(message.from_user.id),
+        reply_markup=profiles_keyboard(message.from_user.id),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data == "profiles:list")
+async def profiles_list_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        format_profiles_text(callback.from_user.id),
+        reply_markup=profiles_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "profiles:add")
+async def profiles_add_callback(callback: CallbackQuery):
+    set_user_flag(callback.from_user.id, "awaiting_profile_name", "1")
+    await callback.message.edit_text(
+        "➕ <b>Добавить профиль</b>\n\nВведите имя профиля одним сообщением.\n\nНапример: <b>Серафим</b> или <b>Таня</b>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К профилям", callback_data="profiles:cancel_add")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "profiles:cancel_add")
+async def profiles_cancel_add_callback(callback: CallbackQuery):
+    delete_user_flag(callback.from_user.id, "awaiting_profile_name")
+    await callback.message.edit_text(
+        format_profiles_text(callback.from_user.id),
+        reply_markup=profiles_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "profiles:family")
+async def profiles_family_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        family_text(callback.from_user.id),
+        reply_markup=family_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+
+
+@dp.callback_query(F.data.startswith("family:mode:"))
+async def family_mode_callback(callback: CallbackQuery):
+    mode = callback.data.split(":", 2)[2]
+    set_family_mode(callback.from_user.id, mode)
+    await callback.message.edit_text(
+        family_text(callback.from_user.id),
+        reply_markup=family_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Настройки семьи сохранены")
+
+
+@dp.callback_query(F.data.startswith("family:toggle:"))
+async def family_toggle_callback(callback: CallbackQuery):
+    key = callback.data.split(":", 2)[2]
+    if key not in {"prefs", "limits", "goals", "history"}:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    current = family_consider_enabled(callback.from_user.id, key)
+    set_family_consider(callback.from_user.id, key, not current)
+    await callback.message.edit_text(
+        family_text(callback.from_user.id),
+        reply_markup=family_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Настройки семьи обновлены")
+
+
+@dp.callback_query(F.data == "family:select")
+async def family_select_callback(callback: CallbackQuery):
+    profiles = get_profiles(callback.from_user.id)
+    if profiles and not family_selected_codes(callback.from_user.id):
+        set_family_selected_codes(callback.from_user.id, [p["profile_code"] for p in profiles])
+    set_family_mode(callback.from_user.id, "selected")
+    await callback.message.edit_text(
+        family_select_text(callback.from_user.id),
+        reply_markup=family_select_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("family:select_toggle:"))
+async def family_select_toggle_callback(callback: CallbackQuery):
+    profile_code = callback.data.split(":", 2)[2]
+    profiles = get_profiles(callback.from_user.id)
+    valid_codes = {p["profile_code"] for p in profiles}
+    if profile_code not in valid_codes:
+        await callback.answer("Профиль не найден", show_alert=True)
+        return
+    selected = family_selected_codes(callback.from_user.id)
+    if profile_code in selected:
+        selected = [code for code in selected if code != profile_code]
+    else:
+        selected.append(profile_code)
+    set_family_selected_codes(callback.from_user.id, selected)
+    set_family_mode(callback.from_user.id, "selected")
+    await callback.message.edit_text(
+        family_select_text(callback.from_user.id),
+        reply_markup=family_select_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Обновлено")
+
+
+@dp.callback_query(F.data == "family:select_save")
+async def family_select_save_callback(callback: CallbackQuery):
+    set_family_mode(callback.from_user.id, "selected")
+    await callback.message.edit_text(
+        family_text(callback.from_user.id),
+        reply_markup=family_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Сохранено")
+
+
+@dp.callback_query(F.data.startswith("profiles:view:"))
+async def profiles_view_callback(callback: CallbackQuery):
+    profile_code = callback.data.split(":", 2)[2]
+    profile = get_profile(callback.from_user.id, profile_code)
+    if not profile:
+        await callback.answer("Профиль не найден", show_alert=True)
+        return
+    await callback.message.edit_text(
+        profile_detail_text(profile),
+        reply_markup=profile_detail_keyboard(profile_code),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("profiles:data:"))
+@dp.callback_query(F.data.startswith("profiles:prefs:"))
+@dp.callback_query(F.data.startswith("profiles:limits:"))
+@dp.callback_query(F.data.startswith("profiles:goal:"))
+async def profile_section_callback(callback: CallbackQuery):
+    _, section, profile_code = callback.data.split(":", 2)
+    profile = get_profile(callback.from_user.id, profile_code)
+    if not profile:
+        await callback.answer("Профиль не найден", show_alert=True)
+        return
+    await callback.message.edit_text(
+        profile_section_text(profile, section),
+        reply_markup=profile_section_keyboard(profile_code, section),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("profiles:edit:"))
+async def profile_edit_callback(callback: CallbackQuery):
+    _, _, field, profile_code = callback.data.split(":", 3)
+    profile = get_profile(callback.from_user.id, profile_code)
+    if not profile:
+        await callback.answer("Профиль не найден", show_alert=True)
+        return
+    set_user_flag(callback.from_user.id, "awaiting_profile_edit", f"{profile_code}:{field}")
+    await callback.message.edit_text(
+        profile_edit_prompt(field, profile),
+        reply_markup=profile_edit_cancel_keyboard(profile_code),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("profiles:edit_cancel:"))
+async def profile_edit_cancel_callback(callback: CallbackQuery):
+    profile_code = callback.data.split(":", 2)[2]
+    delete_user_flag(callback.from_user.id, "awaiting_profile_edit")
+    profile = get_profile(callback.from_user.id, profile_code)
+    if not profile:
+        await callback.answer("Профиль не найден", show_alert=True)
+        return
+    await callback.message.edit_text(
+        profile_detail_text(profile),
+        reply_markup=profile_detail_keyboard(profile_code),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("profiles:gender:"))
+async def profile_gender_callback(callback: CallbackQuery):
+    profile_code = callback.data.split(":", 2)[2]
+    profile = get_profile(callback.from_user.id, profile_code)
+    if not profile:
+        await callback.answer("Профиль не найден", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"🚻 <b>Пол</b>\n\n👤 <b>{profile['name']}</b>\n\nВыберите значение.",
+        reply_markup=profile_gender_keyboard(profile_code),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("profiles:setgender:"))
+async def profile_set_gender_callback(callback: CallbackQuery):
+    _, _, gender, profile_code = callback.data.split(":", 3)
+    update_profile_field_db(callback.from_user.id, profile_code, "gender", gender)
+    profile = get_profile(callback.from_user.id, profile_code)
+    await callback.message.edit_text(
+        profile_section_text(profile, "data"),
+        reply_markup=profile_section_keyboard(profile_code, "data"),
+        parse_mode="HTML",
+    )
+    await callback.answer("Пол сохранён")
+
+
+@dp.callback_query(F.data.startswith("profiles:setgoal:"))
+async def profile_set_goal_callback(callback: CallbackQuery):
+    _, _, goal, profile_code = callback.data.split(":", 3)
+    update_profile_field_db(callback.from_user.id, profile_code, "goal", goal)
+    profile = get_profile(callback.from_user.id, profile_code)
+    await callback.message.edit_text(
+        profile_section_text(profile, "goal"),
+        reply_markup=profile_section_keyboard(profile_code, "goal"),
+        parse_mode="HTML",
+    )
+    await callback.answer("Цель сохранена")
+
+
+@dp.callback_query(F.data.startswith("profiles:clear:"))
+async def profile_clear_callback(callback: CallbackQuery):
+    _, _, field, profile_code = callback.data.split(":", 3)
+    if field not in {"preferences", "restrictions"}:
+        await callback.answer("Нельзя очистить это поле", show_alert=True)
+        return
+    update_profile_field_db(callback.from_user.id, profile_code, field, "")
+    section = "prefs" if field == "preferences" else "limits"
+    profile = get_profile(callback.from_user.id, profile_code)
+    await callback.message.edit_text(
+        profile_section_text(profile, section),
+        reply_markup=profile_section_keyboard(profile_code, section),
+        parse_mode="HTML",
+    )
+    await callback.answer("Очищено")
+
+
+@dp.callback_query(F.data.startswith("profiles:delete_confirm:"))
+async def profiles_delete_confirm_callback(callback: CallbackQuery):
+    profile_code = callback.data.split(":", 2)[2]
+    profile = get_profile(callback.from_user.id, profile_code)
+    if not profile:
+        await callback.answer("Профиль не найден", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"🗑 <b>Удалить профиль?</b>\n\nПрофиль: <b>{profile['name']}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"profiles:delete:{profile_code}")],
+            [InlineKeyboardButton(text="⬅️ К профилю", callback_data=f"profiles:view:{profile_code}")],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
+        ]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("profiles:delete:"))
+async def profiles_delete_callback(callback: CallbackQuery):
+    profile_code = callback.data.split(":", 2)[2]
+    delete_profile_db(callback.from_user.id, profile_code)
+    await callback.message.edit_text(
+        format_profiles_text(callback.from_user.id),
+        reply_markup=profiles_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Профиль удалён")
 
 
 @dp.callback_query(F.data.startswith("portions:"))
@@ -2555,6 +3206,66 @@ async def clear_callback(callback: CallbackQuery):
 
 @dp.message()
 async def fallback(message: Message):
+    if message.text and get_user_flag(message.from_user.id, "awaiting_profile_name") == "1":
+        name = message.text.strip()
+        if len(name) < 2:
+            await message.answer("Имя слишком короткое. Напишите имя профиля ещё раз.")
+            return
+        if len(name) > 40:
+            await message.answer("Имя слишком длинное. Лучше до 40 символов.")
+            return
+        code = add_profile_db(message.from_user.id, name)
+        delete_user_flag(message.from_user.id, "awaiting_profile_name")
+        profile = get_profile(message.from_user.id, code)
+        await message.answer(
+            profile_detail_text(profile),
+            reply_markup=profile_detail_keyboard(code),
+            parse_mode="HTML",
+        )
+        return
+
+    edit_state = get_user_flag(message.from_user.id, "awaiting_profile_edit")
+    if message.text and edit_state:
+        try:
+            profile_code, field = edit_state.split(":", 1)
+        except ValueError:
+            delete_user_flag(message.from_user.id, "awaiting_profile_edit")
+            await message.answer("Не удалось понять, что редактируем. Попробуйте ещё раз.")
+            return
+
+        value = message.text.strip()
+        if field == "name":
+            if len(value) < 2:
+                await message.answer("Имя слишком короткое. Напишите имя ещё раз.")
+                return
+            if len(value) > 40:
+                await message.answer("Имя слишком длинное. Лучше до 40 символов.")
+                return
+        elif field in {"age", "height", "calories"}:
+            if not value.isdigit():
+                await message.answer("Нужно ввести число. Попробуйте ещё раз.")
+                return
+            value = int(value)
+        elif field == "weight":
+            try:
+                value = float(value.replace(",", "."))
+            except ValueError:
+                await message.answer("Введите вес числом. Например: 86 или 86.5")
+                return
+        elif field in {"preferences", "restrictions"}:
+            # Храним как обычную строку, чтобы быстро редактировать в Telegram.
+            value = ", ".join(part.strip() for part in value.split(",") if part.strip()) or ""
+
+        update_profile_field_db(message.from_user.id, profile_code, field, value)
+        delete_user_flag(message.from_user.id, "awaiting_profile_edit")
+        profile = get_profile(message.from_user.id, profile_code)
+        await message.answer(
+            "✅ Сохранено.\n\n" + profile_detail_text(profile),
+            reply_markup=profile_detail_keyboard(profile_code),
+            parse_mode="HTML",
+        )
+        return
+
     if message.from_user.id in SEARCH_WAITING and message.text:
         query = message.text.strip()
         SEARCH_WAITING.discard(message.from_user.id)
