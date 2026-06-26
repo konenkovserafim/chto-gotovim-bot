@@ -1401,29 +1401,156 @@ def profile_edit_cancel_keyboard(profile_code: str) -> InlineKeyboardMarkup:
 
 
 
+def _load_json_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data]
+
+
+def family_mode(user_id: int) -> str:
+    mode = get_user_flag(user_id, "family_mode")
+    return mode if mode in {"all", "selected"} else "all"
+
+
+def set_family_mode(user_id: int, mode: str) -> None:
+    set_user_flag(user_id, "family_mode", mode if mode in {"all", "selected"} else "all")
+
+
+def family_selected_codes(user_id: int) -> list[str]:
+    return _load_json_list(get_user_flag(user_id, "family_selected_profiles"))
+
+
+def set_family_selected_codes(user_id: int, codes: list[str]) -> None:
+    unique_codes: list[str] = []
+    for code in codes:
+        if code and code not in unique_codes:
+            unique_codes.append(code)
+    set_user_flag(user_id, "family_selected_profiles", json.dumps(unique_codes, ensure_ascii=False))
+
+
+def family_consider_enabled(user_id: int, key: str) -> bool:
+    value = get_user_flag(user_id, f"family_consider_{key}")
+    return value != "0"
+
+
+def set_family_consider(user_id: int, key: str, enabled: bool) -> None:
+    set_user_flag(user_id, f"family_consider_{key}", "1" if enabled else "0")
+
+
+def family_active_profiles(user_id: int) -> list[dict[str, Any]]:
+    profiles = get_profiles(user_id)
+    if family_mode(user_id) == "all":
+        return profiles
+    selected = set(family_selected_codes(user_id))
+    return [profile for profile in profiles if profile.get("profile_code") in selected]
+
+
 def family_text(user_id: int) -> str:
     profiles = get_profiles(user_id)
+    mode = family_mode(user_id)
+    active = family_active_profiles(user_id)
+    active_codes = {p.get("profile_code") for p in active}
+
     lines = ["👨‍👩‍👧 <b>Семья</b>", ""]
     if not profiles:
         lines.append("Пока участников нет.")
         lines.append("Добавьте первый профиль, чтобы бот понимал, для кого готовим.")
+        return "\n".join(lines).strip()
+
+    lines.append("<b>Участники:</b>")
+    for profile in profiles:
+        mark = "✅" if mode == "all" or profile.get("profile_code") in active_codes else "☐"
+        lines.append(f"{mark} {profile['name']}")
+
+    lines.append("")
+    lines.append("<b>🍽 Для кого готовим</b>")
+    if mode == "all":
+        lines.append("🟢 Для всех")
     else:
-        lines.append("Участники:")
-        for p in profiles:
-            lines.append(f"✅ {p['name']}")
-        lines.append("")
-        lines.append("Позже здесь появятся общие настройки: для кого готовим и чьи предпочтения учитывать.")
+        if active:
+            names = ", ".join(p["name"] for p in active)
+            lines.append(f"🟢 Для выбранных: {names}")
+        else:
+            lines.append("🟡 Для выбранных: пока никто не выбран")
+
+    lines.append("")
+    lines.append("<b>🧠 При подборе учитывать</b>")
+    consider_labels = [
+        ("prefs", "Предпочтения"),
+        ("limits", "Ограничения"),
+        ("goals", "Цели"),
+        ("history", "Историю приготовлений"),
+    ]
+    for key, label in consider_labels:
+        mark = "✅" if family_consider_enabled(user_id, key) else "☐"
+        lines.append(f"{mark} {label}")
+
+    lines.append("")
+    active_count = len(active) if mode == "selected" else len(profiles)
+    lines.append(f"👥 Размер семьи для подбора: <b>{active_count}</b>")
     return "\n".join(lines).strip()
 
 
-def family_keyboard() -> InlineKeyboardMarkup:
+def family_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    mode = family_mode(user_id)
+    all_text = "✅ Для всех" if mode == "all" else "○ Для всех"
+    selected_text = "✅ Для выбранных" if mode == "selected" else "○ Для выбранных"
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(text=all_text, callback_data="family:mode:all"),
+                InlineKeyboardButton(text=selected_text, callback_data="family:mode:selected"),
+            ],
+            [InlineKeyboardButton(text="👥 Выбрать участников", callback_data="family:select")],
+            [
+                InlineKeyboardButton(text=("✅ Предпочтения" if family_consider_enabled(user_id, "prefs") else "☐ Предпочтения"), callback_data="family:toggle:prefs"),
+                InlineKeyboardButton(text=("✅ Ограничения" if family_consider_enabled(user_id, "limits") else "☐ Ограничения"), callback_data="family:toggle:limits"),
+            ],
+            [
+                InlineKeyboardButton(text=("✅ Цели" if family_consider_enabled(user_id, "goals") else "☐ Цели"), callback_data="family:toggle:goals"),
+                InlineKeyboardButton(text=("✅ История" if family_consider_enabled(user_id, "history") else "☐ История"), callback_data="family:toggle:history"),
+            ],
             [InlineKeyboardButton(text="➕ Добавить профиль", callback_data="profiles:add")],
+            [InlineKeyboardButton(text="✏️ Управление участниками", callback_data="profiles:list")],
             [InlineKeyboardButton(text="⬅️ К профилям", callback_data="profiles:list")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
         ]
     )
+
+
+def family_select_text(user_id: int) -> str:
+    profiles = get_profiles(user_id)
+    selected = set(family_selected_codes(user_id))
+    lines = ["👥 <b>Для кого готовим?</b>", ""]
+    if not profiles:
+        lines.append("Профилей пока нет. Сначала добавьте участника.")
+        return "\n".join(lines).strip()
+    lines.append("Отметьте участников, для которых бот будет подбирать блюда.")
+    lines.append("")
+    for profile in profiles:
+        mark = "☑️" if profile.get("profile_code") in selected else "☐"
+        lines.append(f"{mark} {profile['name']}")
+    return "\n".join(lines).strip()
+
+
+def family_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    profiles = get_profiles(user_id)
+    selected = set(family_selected_codes(user_id))
+    rows: list[list[InlineKeyboardButton]] = []
+    for profile in profiles:
+        code = profile.get("profile_code")
+        mark = "☑️" if code in selected else "☐"
+        rows.append([InlineKeyboardButton(text=f"{mark} {profile['name']}", callback_data=f"family:select_toggle:{code}")])
+    rows.append([InlineKeyboardButton(text="💾 Сохранить", callback_data="family:select_save")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="profiles:family")])
+    rows.append([InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 
@@ -2541,10 +2668,88 @@ async def profiles_cancel_add_callback(callback: CallbackQuery):
 async def profiles_family_callback(callback: CallbackQuery):
     await callback.message.edit_text(
         family_text(callback.from_user.id),
-        reply_markup=family_keyboard(),
+        reply_markup=family_keyboard(callback.from_user.id),
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+
+
+@dp.callback_query(F.data.startswith("family:mode:"))
+async def family_mode_callback(callback: CallbackQuery):
+    mode = callback.data.split(":", 2)[2]
+    set_family_mode(callback.from_user.id, mode)
+    await callback.message.edit_text(
+        family_text(callback.from_user.id),
+        reply_markup=family_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Настройки семьи сохранены")
+
+
+@dp.callback_query(F.data.startswith("family:toggle:"))
+async def family_toggle_callback(callback: CallbackQuery):
+    key = callback.data.split(":", 2)[2]
+    if key not in {"prefs", "limits", "goals", "history"}:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    current = family_consider_enabled(callback.from_user.id, key)
+    set_family_consider(callback.from_user.id, key, not current)
+    await callback.message.edit_text(
+        family_text(callback.from_user.id),
+        reply_markup=family_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Настройки семьи обновлены")
+
+
+@dp.callback_query(F.data == "family:select")
+async def family_select_callback(callback: CallbackQuery):
+    profiles = get_profiles(callback.from_user.id)
+    if profiles and not family_selected_codes(callback.from_user.id):
+        set_family_selected_codes(callback.from_user.id, [p["profile_code"] for p in profiles])
+    set_family_mode(callback.from_user.id, "selected")
+    await callback.message.edit_text(
+        family_select_text(callback.from_user.id),
+        reply_markup=family_select_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("family:select_toggle:"))
+async def family_select_toggle_callback(callback: CallbackQuery):
+    profile_code = callback.data.split(":", 2)[2]
+    profiles = get_profiles(callback.from_user.id)
+    valid_codes = {p["profile_code"] for p in profiles}
+    if profile_code not in valid_codes:
+        await callback.answer("Профиль не найден", show_alert=True)
+        return
+    selected = family_selected_codes(callback.from_user.id)
+    if profile_code in selected:
+        selected = [code for code in selected if code != profile_code]
+    else:
+        selected.append(profile_code)
+    set_family_selected_codes(callback.from_user.id, selected)
+    set_family_mode(callback.from_user.id, "selected")
+    await callback.message.edit_text(
+        family_select_text(callback.from_user.id),
+        reply_markup=family_select_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Обновлено")
+
+
+@dp.callback_query(F.data == "family:select_save")
+async def family_select_save_callback(callback: CallbackQuery):
+    set_family_mode(callback.from_user.id, "selected")
+    await callback.message.edit_text(
+        family_text(callback.from_user.id),
+        reply_markup=family_keyboard(callback.from_user.id),
+        parse_mode="HTML",
+    )
+    await callback.answer("Сохранено")
 
 
 @dp.callback_query(F.data.startswith("profiles:view:"))
