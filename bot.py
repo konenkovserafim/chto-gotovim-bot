@@ -588,7 +588,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🍳 Завтрак"), KeyboardButton(text="🍲 Обед")],
             [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🥗 Перекус")],
-            [KeyboardButton(text="🎲 Подобрать блюдо"), KeyboardButton(text="🔍 Поиск")],
+            [KeyboardButton(text="📅 Меню недели"), KeyboardButton(text="🔍 Поиск")],
             [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="❤️ Избранное")],
             [KeyboardButton(text="🏠 Главная"), KeyboardButton(text="🛒 Список продуктов")],
             [KeyboardButton(text="🥶 Холодильник"), KeyboardButton(text="👥 Профили")],
@@ -865,10 +865,11 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:notifications")],
-            [InlineKeyboardButton(text="📖 История приготовлений", callback_data="settings:history")],
-            [InlineKeyboardButton(text="📅 Меню недели", callback_data="settings:weekly")],
-            [InlineKeyboardButton(text="🔍 Фильтры поиска", callback_data="filters:menu")],
+            [InlineKeyboardButton(text="⏰ Время завтрака", callback_data="settings:breakfast_time")],
+            [InlineKeyboardButton(text="⏰ Время обеда", callback_data="settings:lunch_time")],
+            [InlineKeyboardButton(text="⏰ Время ужина", callback_data="settings:dinner_time")],
             [InlineKeyboardButton(text="👥 Профили", callback_data="settings:profiles")],
+            [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="history:clear")],
             [InlineKeyboardButton(text="ℹ️ О боте", callback_data="settings:about")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="home:main")],
         ]
@@ -876,7 +877,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
 
 
 def settings_text() -> str:
-    return "⚙️ <b>Настройки</b>\n\nЧто хотите настроить?"
+    return "⚙️ <b>Настройки</b>\n\nЗдесь настройки самого бота."
 
 
 def about_text(user_id: int) -> str:
@@ -1838,17 +1839,25 @@ async def recommend_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.message(F.text == "📅 Меню недели")
+async def weekly_menu_message(message: Message):
+    menu = get_saved_weekly_menu(message.from_user.id)
+    await message.answer(
+        format_weekly_menu(menu),
+        reply_markup=weekly_menu_keyboard(bool(menu)),
+        parse_mode="HTML",
+    )
+
+
 @dp.message(F.text == "🔍 Поиск")
 async def search_message(message: Message):
     SEARCH_WAITING.add(message.from_user.id)
     await message.answer(
         "🔍 <b>Поиск блюда</b>\n\n"
-        "Напиши, что искать. Например:\n"
-        "• курица\n"
-        "• рис\n"
-        "• сыр\n"
-        "• суп\n"
-        "• творог",
+        "Введите название блюда или ингредиент.\n\n"
+        "Например: <b>курица</b>, <b>рис</b>, <b>сыр</b>, <b>суп</b>, <b>творог</b>.\n\n"
+        "Или выберите фильтр 👇",
+        reply_markup=filter_menu_keyboard(),
         parse_mode="HTML",
     )
 
@@ -1877,6 +1886,21 @@ async def settings_menu_callback(callback: CallbackQuery):
 async def settings_notifications_callback(callback: CallbackQuery):
     await callback.message.edit_text(
         "🔔 <b>Уведомления</b>\n\n🚧 Скоро появится. Здесь настроим напоминания на завтрак, обед и ужин.",
+        reply_markup=back_to_settings_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_({"settings:breakfast_time", "settings:lunch_time", "settings:dinner_time"}))
+async def settings_meal_time_callback(callback: CallbackQuery):
+    titles = {
+        "settings:breakfast_time": "⏰ <b>Время завтрака</b>",
+        "settings:lunch_time": "⏰ <b>Время обеда</b>",
+        "settings:dinner_time": "⏰ <b>Время ужина</b>",
+    }
+    await callback.message.edit_text(
+        f"{titles.get(callback.data, '⏰ <b>Время приёма пищи</b>')}\n\n🚧 Скоро здесь можно будет настроить удобное время напоминаний.",
         reply_markup=back_to_settings_keyboard(),
         parse_mode="HTML",
     )
