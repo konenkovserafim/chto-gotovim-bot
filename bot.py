@@ -1155,16 +1155,36 @@ def replace_weekly_menu_item(user_id: int, day_index: int, slot_index: int) -> d
     category = str(items[slot_index].get("category") or ["breakfast", "lunch", "dinner"][min(slot_index, 2)])
     current_id = int(items[slot_index].get("id", 0) or 0)
 
+    # Сначала стараемся заменить на блюдо той же категории, которого ещё нет в меню недели.
     used_ids: set[int] = set()
     for day_items in menu.values():
         for recipe in day_items:
             recipe_id = int(recipe.get("id", 0) or 0)
-            if recipe_id and recipe_id != current_id:
+            if recipe_id:
                 used_ids.add(recipe_id)
 
-    new_recipe = pick_week_recipe(category, user_id, used_ids)
-    if not new_recipe:
+    candidates = [
+        recipe for recipe in recipes_for_category(category)
+        if int(recipe.get("id", 0) or 0) not in used_ids
+    ]
+
+    # Если все блюда этой категории уже встречаются в меню, разрешаем повторы,
+    # но всё равно не возвращаем то же самое блюдо.
+    if not candidates:
+        candidates = [
+            recipe for recipe in recipes_for_category(category)
+            if int(recipe.get("id", 0) or 0) != current_id
+        ]
+
+    if not candidates:
         return None
+
+    scored = [
+        (score_recipe_for_week(recipe, user_id, used_ids), random.random(), recipe)
+        for recipe in candidates
+    ]
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    new_recipe = scored[0][2]
 
     items[slot_index] = new_recipe
     menu[day] = items
