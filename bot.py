@@ -1249,14 +1249,28 @@ def week_replace_menu_keyboard(menu: dict[str, list[dict[str, Any]]]) -> InlineK
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def normalize_product_name(name: str) -> str:
+    """Приводит название продукта к аккуратному виду для списка покупок."""
+    cleaned = " ".join(str(name).strip().split())
+    if not cleaned:
+        return cleaned
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def is_taste_item(text: str) -> bool:
+    """Определяет продукты без точного количества: «по вкусу»."""
+    return "по вкусу" in str(text).lower()
+
+
 def parse_ingredient_line(line: str) -> tuple[str, float, str] | None:
-    """Пробует разобрать строку ингредиента вида "Молоко — 400 мл".
+    """Пробует разобрать строку ингредиента вида «Молоко — 400 мл».
 
     Возвращает: (название, количество, единица).
-    Если формат сложный или количество не число — возвращает None.
+    Объединяем только безопасные случаи: число + одинаковая единица.
+    Сложные строки вроде «по вкусу» не объединяем.
     """
     text = str(line).strip()
-    if not text:
+    if not text or is_taste_item(text):
         return None
 
     if "—" in text:
@@ -1266,7 +1280,7 @@ def parse_ingredient_line(line: str) -> tuple[str, float, str] | None:
     else:
         return None
 
-    name = name.strip()
+    name = normalize_product_name(name)
     amount_part = amount_part.strip()
     if not name or not amount_part:
         return None
@@ -1281,7 +1295,7 @@ def parse_ingredient_line(line: str) -> tuple[str, float, str] | None:
     except ValueError:
         return None
 
-    unit = " ".join(pieces[1:]).strip()
+    unit = " ".join(pieces[1:]).strip().lower()
     if not unit:
         unit = "шт."
 
@@ -1294,11 +1308,36 @@ def format_amount(amount: float) -> str:
     return str(round(amount, 2)).replace(".", ",")
 
 
+def normalize_shopping_text(item: str) -> str:
+    """Нормализует строку покупки без изменения смысла."""
+    text = " ".join(str(item).strip().split())
+    if "—" in text:
+        name, rest = text.split("—", 1)
+        return f"{normalize_product_name(name)} — {rest.strip()}"
+    if "-" in text:
+        name, rest = text.split("-", 1)
+        return f"{normalize_product_name(name)} — {rest.strip()}"
+    return normalize_product_name(text)
+
+
+def split_taste_items(items: list[str]) -> tuple[list[str], list[str]]:
+    regular: list[str] = []
+    taste: list[str] = []
+    for item in items:
+        normalized = normalize_shopping_text(item)
+        if is_taste_item(normalized):
+            taste.append(normalized)
+        else:
+            regular.append(normalized)
+    return regular, taste
+
+
 def build_weekly_shopping_items(menu: dict[str, list[dict[str, Any]]]) -> list[str]:
     """Собирает продукты из меню недели и аккуратно объединяет одинаковые.
 
-    Объединяем только безопасные случаи: одинаковое название + одинаковая единица.
-    Если строку нельзя разобрать, добавляем её как есть и убираем точные дубли.
+    Работает с текущим форматом recipes.json, где ингредиенты — обычные строки.
+    Объединяет только одинаковые продукты с одинаковой единицей измерения.
+    Остальное добавляет как есть, но без точных дублей и с аккуратным регистром.
     """
     totals: dict[tuple[str, str], dict[str, Any]] = {}
     raw_items: list[str] = []
@@ -1312,7 +1351,7 @@ def build_weekly_shopping_items(menu: dict[str, list[dict[str, Any]]]) -> list[s
 
                 parsed = parse_ingredient_line(text)
                 if not parsed:
-                    raw_items.append(text)
+                    raw_items.append(normalize_shopping_text(text))
                     continue
 
                 name, amount, unit = parsed
@@ -1326,7 +1365,6 @@ def build_weekly_shopping_items(menu: dict[str, list[dict[str, Any]]]) -> list[s
         for item in totals.values()
     ]
 
-    # Добавляем неразобранные строки без точных дублей
     seen = {item.lower() for item in result}
     for item in raw_items:
         key = item.lower()
@@ -1334,7 +1372,8 @@ def build_weekly_shopping_items(menu: dict[str, list[dict[str, Any]]]) -> list[s
             result.append(item)
             seen.add(key)
 
-    return sorted(result, key=str.lower)
+    regular, taste = split_taste_items(result)
+    return sorted(regular, key=str.lower) + sorted(taste, key=str.lower)
 
 
 def add_weekly_menu_to_shopping(user_id: int) -> int:
@@ -1671,8 +1710,7 @@ async def week_shopping_callback(callback: CallbackQuery):
     await callback.answer(f"Добавлено продуктов: {added} 🛒")
     await callback.message.answer(
         f"🛒 Добавлено в список покупок: <b>{added}</b>\n\n"
-        "Одинаковые продукты пока могут повторяться. "
-        "Объединение сделаем отдельным шагом.",
+        "Одинаковые продукты объединены, где это безопасно.",
         parse_mode="HTML",
     )
 
@@ -1841,9 +1879,20 @@ async def shopping_message(message: Message):
     if not items:
         await message.answer("🛒 Список продуктов пока пуст.")
         return
+
+    regular, taste = split_taste_items(items)
+
     lines = ["🛒 <b>Список продуктов</b>", ""]
-    for item in items:
-        lines.append(f"• {item}")
+    for item in sorted(regular, key=str.lower):
+        lines.append(f"☐ {item}")
+
+    if taste:
+        if regular:
+            lines.append("")
+        lines.append("<b>По вкусу:</b>")
+        for item in sorted(taste, key=str.lower):
+            lines.append(f"☐ {item}")
+
     await message.answer("\n".join(lines), reply_markup=clear_keyboard("shopping"), parse_mode="HTML")
 
 
