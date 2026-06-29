@@ -389,6 +389,80 @@ def onboarding_intro_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def onboarding_lesson_text(step: int) -> str:
+    lessons = {
+        1: (
+            "1/4\n\n"
+            "🏠 <b>Главная</b>\n\n"
+            "Это стартовый экран бота. Он меняется по времени суток:\n"
+            "☀️ утром — завтрак, 🍲 днём — обед, 🌙 вечером — ужин.\n\n"
+            "Сюда всегда можно вернуться кнопкой <b>🏠 Главная</b>."
+        ),
+        2: (
+            "2/4\n\n"
+            "🍽 <b>Рецепты и поиск</b>\n\n"
+            "Кнопки <b>🍳 Завтрак</b>, <b>🍲 Обед</b>, <b>🍽 Ужин</b> и <b>🥗 Перекус</b> открывают списки блюд.\n\n"
+            "В карточке рецепта можно:\n"
+            "✅ отметить, что приготовили;\n"
+            "⭐ поставить оценку;\n"
+            "❤️ добавить в избранное;\n"
+            "🛒 отправить ингредиенты в список продуктов.\n\n"
+            "В <b>🔍 Поиске</b> можно искать блюда по названию или ингредиентам и использовать фильтры."
+        ),
+        3: (
+            "3/4\n\n"
+            "📅 <b>Меню недели, покупки и холодильник</b>\n\n"
+            "<b>📅 Меню недели</b> подбирает блюда на 7 дней с учётом профилей, ограничений и истории.\n\n"
+            "<b>🛒 Список продуктов</b> хранит то, что нужно купить. Туда можно добавить продукты из рецепта или сразу из меню недели.\n\n"
+            "<b>🥶 Холодильник</b> нужен, чтобы отметить продукты, которые уже есть дома. Так рекомендации становятся точнее."
+        ),
+        4: (
+            "4/4\n\n"
+            "👥 <b>Профили, семья и настройки</b>\n\n"
+            "В <b>👥 Профилях</b> можно добавить каждого участника семьи: имя, цель, предпочтения и ограничения.\n\n"
+            "В <b>👨‍👩‍👧 Семье</b> выбирается, для кого готовим и чьи вкусы учитывать.\n\n"
+            "В <b>⚙️ Настройках</b> находятся уведомления, история, обучение и информация о боте."
+        ),
+    }
+    return lessons.get(step, lessons[1])
+
+
+def onboarding_lesson_keyboard(step: int) -> InlineKeyboardMarkup:
+    if step < 4:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Дальше ➡️", callback_data=f"onboarding:lesson:{step + 1}")],
+            [InlineKeyboardButton(text="Пропустить", callback_data="onboarding:skip")],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Создать первый профиль", callback_data="onboarding:create_profile")],
+        [InlineKeyboardButton(text="Заполню позже", callback_data="onboarding:notifications")],
+    ])
+
+
+def onboarding_profile_preferences_text(name: str | None = None) -> str:
+    name_line = f"для <b>{name}</b>" if name else ""
+    return (
+        f"❤️ <b>Предпочтения {name_line}</b>\n\n"
+        "Напишите, что нравится. Можно через запятую.\n\n"
+        "Например: <b>курица, паста, сырники, итальянская кухня</b>."
+    )
+
+
+def onboarding_profile_restrictions_text(name: str | None = None) -> str:
+    name_line = f"для <b>{name}</b>" if name else ""
+    return (
+        f"🚫 <b>Ограничения {name_line}</b>\n\n"
+        "Напишите, что не предлагать. Можно через запятую.\n\n"
+        "Например: <b>свинина, грибы, морепродукты, острое</b>."
+    )
+
+
+def onboarding_skip_field_keyboard(field: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустить", callback_data=f"onboarding:skip_{field}")],
+    ])
+
+
 def onboarding_profile_prompt_text() -> str:
     return (
         "👤 <b>Давайте создадим первый профиль.</b>\n\n"
@@ -2715,7 +2789,35 @@ async def start(message: Message):
 @dp.callback_query(F.data == "onboarding:start")
 async def onboarding_start_callback(callback: CallbackQuery):
     set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
+    await callback.message.edit_text(
+        onboarding_lesson_text(1),
+        reply_markup=onboarding_lesson_keyboard(1),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("onboarding:lesson:"))
+async def onboarding_lesson_callback(callback: CallbackQuery):
+    try:
+        step = int(callback.data.split(":")[-1])
+    except ValueError:
+        step = 1
+    await callback.message.edit_text(
+        onboarding_lesson_text(step),
+        reply_markup=onboarding_lesson_keyboard(step),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:create_profile")
+async def onboarding_create_profile_callback(callback: CallbackQuery):
+    set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
     set_user_flag(callback.from_user.id, "awaiting_profile_name", "1")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
+    delete_user_flag(callback.from_user.id, "onboarding_profile_code")
     await callback.message.edit_text(
         onboarding_profile_prompt_text(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2730,6 +2832,9 @@ async def onboarding_start_callback(callback: CallbackQuery):
 async def onboarding_add_profile_callback(callback: CallbackQuery):
     set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
     set_user_flag(callback.from_user.id, "awaiting_profile_name", "1")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
+    delete_user_flag(callback.from_user.id, "onboarding_profile_code")
     await callback.message.edit_text(
         onboarding_profile_prompt_text(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2740,9 +2845,48 @@ async def onboarding_add_profile_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+def finish_onboarding_profile_text(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    profile_code = get_user_flag(user_id, "onboarding_profile_code")
+    profile = get_profile(user_id, profile_code) if profile_code else None
+    name = profile["name"] if profile else "Профиль"
+    delete_user_flag(user_id, "onboarding_profile_code")
+    delete_user_flag(user_id, "awaiting_onboarding_preferences")
+    delete_user_flag(user_id, "awaiting_onboarding_restrictions")
+    return (
+        "✅ <b>Профиль заполнен.</b>\n\n"
+        f"👤 {name}\n\n"
+        "Хотите добавить ещё одного участника семьи?",
+        onboarding_add_more_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "onboarding:skip_preferences")
+async def onboarding_skip_preferences_callback(callback: CallbackQuery):
+    profile_code = get_user_flag(callback.from_user.id, "onboarding_profile_code")
+    profile = get_profile(callback.from_user.id, profile_code) if profile_code else None
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    set_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions", "1")
+    await callback.message.edit_text(
+        onboarding_profile_restrictions_text(profile.get("name") if profile else None),
+        reply_markup=onboarding_skip_field_keyboard("restrictions"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:skip_restrictions")
+async def onboarding_skip_restrictions_callback(callback: CallbackQuery):
+    text, keyboard = finish_onboarding_profile_text(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "onboarding:notifications")
 async def onboarding_notifications_callback(callback: CallbackQuery):
     delete_user_flag(callback.from_user.id, "awaiting_profile_name")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
+    delete_user_flag(callback.from_user.id, "onboarding_profile_code")
     await callback.message.edit_text(
         onboarding_notifications_text(),
         reply_markup=onboarding_notifications_keyboard(),
@@ -3276,6 +3420,10 @@ async def profile_section_callback(callback: CallbackQuery):
     if not profile:
         await callback.answer("Профиль не найден", show_alert=True)
         return
+    if section in {"prefs", "limits"}:
+        set_user_flag(callback.from_user.id, "profile_context", f"{profile_code}:{section}")
+    else:
+        delete_user_flag(callback.from_user.id, "profile_context")
     await callback.message.edit_text(
         profile_section_text(profile, section),
         reply_markup=profile_section_keyboard(profile_code, section),
@@ -3291,6 +3439,7 @@ async def profile_edit_callback(callback: CallbackQuery):
     if not profile:
         await callback.answer("Профиль не найден", show_alert=True)
         return
+    delete_user_flag(callback.from_user.id, "profile_context")
     set_user_flag(callback.from_user.id, "awaiting_profile_edit", f"{profile_code}:{field}")
     await callback.message.edit_text(
         profile_edit_prompt(field, profile),
@@ -3705,8 +3854,13 @@ async def clear_callback(callback: CallbackQuery):
 
 @dp.message()
 async def fallback(message: Message):
-    if message.text and get_user_flag(message.from_user.id, "awaiting_profile_name") == "1":
-        name = message.text.strip()
+    if not message.text:
+        return
+
+    text_value = message.text.strip()
+
+    if get_user_flag(message.from_user.id, "awaiting_profile_name") == "1":
+        name = text_value
         if len(name) < 2:
             await message.answer("Имя слишком короткое. Напишите имя профиля ещё раз.")
             return
@@ -3715,19 +3869,47 @@ async def fallback(message: Message):
             return
         code = add_profile_db(message.from_user.id, name)
         delete_user_flag(message.from_user.id, "awaiting_profile_name")
+
         if get_user_flag(message.from_user.id, ONBOARDING_FLOW_KEY) == "1":
+            set_user_flag(message.from_user.id, "onboarding_profile_code", code)
+            set_user_flag(message.from_user.id, "awaiting_onboarding_preferences", "1")
             await message.answer(
-                onboarding_add_more_text(),
-                reply_markup=onboarding_add_more_keyboard(),
+                onboarding_profile_preferences_text(name),
+                reply_markup=onboarding_skip_field_keyboard("preferences"),
                 parse_mode="HTML",
             )
             return
+
         profile = get_profile(message.from_user.id, code)
         await message.answer(
             profile_detail_text(profile),
             reply_markup=profile_detail_keyboard(code),
             parse_mode="HTML",
         )
+        return
+
+    if get_user_flag(message.from_user.id, "awaiting_onboarding_preferences") == "1":
+        profile_code = get_user_flag(message.from_user.id, "onboarding_profile_code")
+        profile = get_profile(message.from_user.id, profile_code) if profile_code else None
+        if profile:
+            value = ", ".join(part.strip() for part in text_value.split(",") if part.strip())
+            update_profile_field_db(message.from_user.id, profile_code, "preferences", value)
+        delete_user_flag(message.from_user.id, "awaiting_onboarding_preferences")
+        set_user_flag(message.from_user.id, "awaiting_onboarding_restrictions", "1")
+        await message.answer(
+            onboarding_profile_restrictions_text(profile.get("name") if profile else None),
+            reply_markup=onboarding_skip_field_keyboard("restrictions"),
+            parse_mode="HTML",
+        )
+        return
+
+    if get_user_flag(message.from_user.id, "awaiting_onboarding_restrictions") == "1":
+        profile_code = get_user_flag(message.from_user.id, "onboarding_profile_code")
+        if profile_code:
+            value = ", ".join(part.strip() for part in text_value.split(",") if part.strip())
+            update_profile_field_db(message.from_user.id, profile_code, "restrictions", value)
+        text, keyboard = finish_onboarding_profile_text(message.from_user.id)
+        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
         return
 
     edit_state = get_user_flag(message.from_user.id, "awaiting_profile_edit")
@@ -3771,6 +3953,26 @@ async def fallback(message: Message):
             parse_mode="HTML",
         )
         return
+
+    profile_context = get_user_flag(message.from_user.id, "profile_context")
+    if profile_context and text_value:
+        try:
+            profile_code, section = profile_context.split(":", 1)
+        except ValueError:
+            delete_user_flag(message.from_user.id, "profile_context")
+        else:
+            field = "preferences" if section == "prefs" else "restrictions" if section == "limits" else ""
+            if field:
+                value = ", ".join(part.strip() for part in text_value.split(",") if part.strip())
+                update_profile_field_db(message.from_user.id, profile_code, field, value)
+                delete_user_flag(message.from_user.id, "profile_context")
+                profile = get_profile(message.from_user.id, profile_code)
+                await message.answer(
+                    "✅ Сохранено.\n\n" + profile_section_text(profile, section),
+                    reply_markup=profile_section_keyboard(profile_code, section),
+                    parse_mode="HTML",
+                )
+                return
 
     if message.from_user.id in SEARCH_WAITING and message.text:
         query = message.text.strip()
