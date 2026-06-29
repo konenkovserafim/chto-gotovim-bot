@@ -1650,37 +1650,117 @@ def family_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int]) -> int:
-    """Простая оценка для меню недели: холодильник, избранное, оценки, история и разнообразие."""
+    """Умная оценка блюда для меню недели.
+
+    Использует ту же идею, что и обычный подбор: семья, ограничения,
+    предпочтения, цели, холодильник, избранное, оценки и историю.
+    """
     recipe_id = int(recipe.get("id", 0) or 0)
     score = 0
 
+    # Разнообразие меню недели: не повторяем уже выбранные блюда.
     if recipe_id in used_ids:
-        score -= 100
+        score -= 10000
 
+    recipe_text = _recipe_text_for_matching(recipe)
+
+    active_profiles = family_active_profiles(user_id)
+    consider_prefs = family_consider_enabled(user_id, "prefs")
+    consider_limits = family_consider_enabled(user_id, "limits")
+    consider_goals = family_consider_enabled(user_id, "goals")
+    consider_history = family_consider_enabled(user_id, "history")
+
+    preference_terms: list[str] = []
+    restriction_terms: list[str] = []
+    goals: list[str] = []
+
+    for profile in active_profiles:
+        if consider_prefs:
+            preference_terms.extend(_split_profile_terms(profile.get("preferences")))
+        if consider_limits:
+            restriction_terms.extend(_split_profile_terms(profile.get("restrictions")))
+        if consider_goals:
+            goal = str(profile.get("goal") or "").strip().lower().replace("ё", "е")
+            if goal and goal not in goals:
+                goals.append(goal)
+
+    preference_terms = list(dict.fromkeys(preference_terms))
+    restriction_terms = list(dict.fromkeys(restriction_terms))
+
+    # Ограничения семьи — самый важный фактор. Такие блюда почти полностью исключаем.
+    blocked_terms = _matched_terms(recipe, restriction_terms)
+    if blocked_terms:
+        score -= 10000
+
+    # Предпочтения семьи.
+    matched_prefs = _matched_terms(recipe, preference_terms)
+    if matched_prefs:
+        score += min(35, 12 + len(matched_prefs) * 6)
+
+    # Цели профилей.
+    calories = int(recipe.get("calories", 0) or 0)
+    for goal in goals:
+        if "похуд" in goal:
+            if calories and calories <= 650:
+                score += 22
+            elif calories and calories <= 800:
+                score += 10
+            elif calories and calories >= 1000:
+                score -= 25
+        elif "набор" in goal or "мас" in goal:
+            if calories and calories >= 700:
+                score += 18
+            elif calories and calories <= 450:
+                score -= 8
+        elif "поддерж" in goal:
+            if calories and 450 <= calories <= 900:
+                score += 8
+
+    # Холодильник: чем больше есть дома, тем выше блюдо в меню.
     selected = set(get_fridge_items(user_id))
     required = detected_product_codes(recipe)
-    if required:
+    if selected and required:
         matched = required & selected
         missing = required - selected
         if not missing:
-            score += 8
-        elif len(missing) <= 2:
-            score += 4
-        score += min(len(matched), 3)
+            score += 55
+        elif matched and len(missing) <= 2:
+            score += 30 - len(missing) * 5
+        elif matched:
+            score += 12
+        score += min(len(matched), 4) * 2
 
+    # Избранное и оценки.
     if recipe_id in set(get_favorites(user_id)):
-        score += 3
+        score += 25
 
     rating = get_user_recipe_rating(user_id, recipe_id)
     if rating:
-        score += rating
+        score += rating * 5
+        if rating <= 2:
+            score -= 15
 
-    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=10):
+    # История: недавно приготовленное не предлагаем повторно.
+    recent_limit = 14 if consider_history else 8
+    recent = get_recent_cooked_recipe_ids(user_id, limit=recent_limit)
+    if recipe_id in recent:
+        score -= 45 if consider_history else 25
+    elif get_cooked_count(user_id) > 0:
+        score += 8
+
+    # Небольшой бонус быстрым блюдам, чтобы меню было реалистичным.
+    time = int(recipe.get("time", 0) or 0)
+    if time and time <= 25:
+        score += 8
+    elif time and time <= 40:
+        score += 4
+    elif time and time >= 70:
         score -= 5
 
-    time = int(recipe.get("time", 0) or 0)
-    if time and time <= 30:
-        score += 1
+    # Лёгкое разнообразие по тексту: если блюдо явно очень специфичное и совпадает
+    # с предпочтениями, оно поднимется выше; если нет данных — останется обычный рандом.
+    if not active_profiles and not selected:
+        score += random.randint(0, 3)
 
     return score
 
@@ -1812,6 +1892,7 @@ def format_weekly_menu(menu: dict[str, list[dict[str, Any]]]) -> str:
             icon = CATEGORY_TITLES.get(recipe.get("category"), "🍽").split()[0]
             lines.append(f"{icon} {recipe['name']}")
         lines.append("")
+    lines.append("🧠 Меню собрано с учётом профилей, истории, оценок, холодильника и ограничений.")
     lines.append("🛒 Можно одной кнопкой добавить продукты в список покупок.")
     return "\n".join(lines).strip()
 
