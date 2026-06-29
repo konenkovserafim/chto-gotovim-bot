@@ -373,20 +373,73 @@ ONBOARDING_FLOW_KEY = "onboarding_flow_v1"
 def onboarding_intro_text() -> str:
     return (
         "🍽 <b>Добро пожаловать в «Что готовим?»</b>\n\n"
-        "Я помогу вам:\n\n"
-        "🥘 подобрать блюда\n"
-        "🛒 составить список покупок\n"
-        "📅 сделать меню недели\n"
-        "👨‍👩‍👧 учитывать вкусы всей семьи\n\n"
-        "Начнём?"
+        "Я помогу вам быстро решить главный вопрос: <b>что сегодня приготовить</b>.\n\n"
+        "Внутри есть рецепты, умный подбор, меню недели, холодильник, список покупок, "
+        "профили семьи, история и уведомления.\n\n"
+        "Сначала покажу, где что находится."
     )
 
 
 def onboarding_intro_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Начать", callback_data="onboarding:start")],
+        [InlineKeyboardButton(text="🚀 Начать обучение", callback_data="onboarding:tour:1")],
         [InlineKeyboardButton(text="Пропустить", callback_data="onboarding:skip")],
     ])
+
+
+def onboarding_tour_text(page: int) -> str:
+    pages = {
+        1: (
+            "1/4 · <b>Главные разделы</b>\n\n"
+            "🏠 <b>Главная</b> — вернуться на стартовый экран.\n"
+            "🍳 <b>Завтрак</b>, 🍲 <b>Обед</b>, 🍽 <b>Ужин</b>, 🥗 <b>Перекус</b> — открыть рецепты по разделам.\n"
+            "📅 <b>Меню недели</b> — составить план питания на 7 дней.\n"
+            "🔍 <b>Поиск</b> — найти блюдо по названию, продукту или фильтрам."
+        ),
+        2: (
+            "2/4 · <b>Рецепты и подбор</b>\n\n"
+            "✨ <b>Подобрать блюдо</b> на главном экране помогает выбрать вариант под текущее время дня.\n\n"
+            "В карточке рецепта можно:\n"
+            "✅ отметить, что приготовили;\n"
+            "⭐ поставить оценку;\n"
+            "❤️ добавить в избранное;\n"
+            "🛒 отправить продукты в список покупок."
+        ),
+        3: (
+            "3/4 · <b>Покупки и холодильник</b>\n\n"
+            "🥶 <b>Холодильник</b> — отметьте продукты, которые есть дома. "
+            "Так бот точнее подберёт блюда.\n\n"
+            "🛒 <b>Список продуктов</b> — сюда попадают ингредиенты из рецептов и меню недели.\n\n"
+            "📅 В меню недели можно одной кнопкой добавить продукты сразу на несколько дней."
+        ),
+        4: (
+            "4/4 · <b>Семья и настройки</b>\n\n"
+            "👥 <b>Профили</b> — добавьте участников семьи, их цели, предпочтения и ограничения.\n"
+            "👨‍👩‍👧 <b>Семья</b> — выберите, для кого готовим.\n"
+            "🔔 <b>Уведомления</b> — напоминания о завтраке, обеде и ужине.\n"
+            "📖 <b>История</b> — блюда, которые вы уже готовили.\n\n"
+            "Теперь можно создать первый профиль."
+        ),
+    }
+    return pages.get(page, pages[1])
+
+
+def onboarding_tour_keyboard(page: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"onboarding:tour:{page - 1}"))
+    if page < 4:
+        nav.append(InlineKeyboardButton(text="Дальше ➡️", callback_data=f"onboarding:tour:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    if page < 4:
+        rows.append([InlineKeyboardButton(text="Пропустить обучение", callback_data="onboarding:profile")])
+    else:
+        rows.append([InlineKeyboardButton(text="👤 Создать первый профиль", callback_data="onboarding:profile")])
+        rows.append([InlineKeyboardButton(text="Пропустить профиль", callback_data="onboarding:notifications")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def onboarding_profile_prompt_text() -> str:
@@ -1650,117 +1703,37 @@ def family_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int]) -> int:
-    """Умная оценка блюда для меню недели.
-
-    Использует ту же идею, что и обычный подбор: семья, ограничения,
-    предпочтения, цели, холодильник, избранное, оценки и историю.
-    """
+    """Простая оценка для меню недели: холодильник, избранное, оценки, история и разнообразие."""
     recipe_id = int(recipe.get("id", 0) or 0)
     score = 0
 
-    # Разнообразие меню недели: не повторяем уже выбранные блюда.
     if recipe_id in used_ids:
-        score -= 10000
+        score -= 100
 
-    recipe_text = _recipe_text_for_matching(recipe)
-
-    active_profiles = family_active_profiles(user_id)
-    consider_prefs = family_consider_enabled(user_id, "prefs")
-    consider_limits = family_consider_enabled(user_id, "limits")
-    consider_goals = family_consider_enabled(user_id, "goals")
-    consider_history = family_consider_enabled(user_id, "history")
-
-    preference_terms: list[str] = []
-    restriction_terms: list[str] = []
-    goals: list[str] = []
-
-    for profile in active_profiles:
-        if consider_prefs:
-            preference_terms.extend(_split_profile_terms(profile.get("preferences")))
-        if consider_limits:
-            restriction_terms.extend(_split_profile_terms(profile.get("restrictions")))
-        if consider_goals:
-            goal = str(profile.get("goal") or "").strip().lower().replace("ё", "е")
-            if goal and goal not in goals:
-                goals.append(goal)
-
-    preference_terms = list(dict.fromkeys(preference_terms))
-    restriction_terms = list(dict.fromkeys(restriction_terms))
-
-    # Ограничения семьи — самый важный фактор. Такие блюда почти полностью исключаем.
-    blocked_terms = _matched_terms(recipe, restriction_terms)
-    if blocked_terms:
-        score -= 10000
-
-    # Предпочтения семьи.
-    matched_prefs = _matched_terms(recipe, preference_terms)
-    if matched_prefs:
-        score += min(35, 12 + len(matched_prefs) * 6)
-
-    # Цели профилей.
-    calories = int(recipe.get("calories", 0) or 0)
-    for goal in goals:
-        if "похуд" in goal:
-            if calories and calories <= 650:
-                score += 22
-            elif calories and calories <= 800:
-                score += 10
-            elif calories and calories >= 1000:
-                score -= 25
-        elif "набор" in goal or "мас" in goal:
-            if calories and calories >= 700:
-                score += 18
-            elif calories and calories <= 450:
-                score -= 8
-        elif "поддерж" in goal:
-            if calories and 450 <= calories <= 900:
-                score += 8
-
-    # Холодильник: чем больше есть дома, тем выше блюдо в меню.
     selected = set(get_fridge_items(user_id))
     required = detected_product_codes(recipe)
-    if selected and required:
+    if required:
         matched = required & selected
         missing = required - selected
         if not missing:
-            score += 55
-        elif matched and len(missing) <= 2:
-            score += 30 - len(missing) * 5
-        elif matched:
-            score += 12
-        score += min(len(matched), 4) * 2
+            score += 8
+        elif len(missing) <= 2:
+            score += 4
+        score += min(len(matched), 3)
 
-    # Избранное и оценки.
     if recipe_id in set(get_favorites(user_id)):
-        score += 25
+        score += 3
 
     rating = get_user_recipe_rating(user_id, recipe_id)
     if rating:
-        score += rating * 5
-        if rating <= 2:
-            score -= 15
+        score += rating
 
-    # История: недавно приготовленное не предлагаем повторно.
-    recent_limit = 14 if consider_history else 8
-    recent = get_recent_cooked_recipe_ids(user_id, limit=recent_limit)
-    if recipe_id in recent:
-        score -= 45 if consider_history else 25
-    elif get_cooked_count(user_id) > 0:
-        score += 8
-
-    # Небольшой бонус быстрым блюдам, чтобы меню было реалистичным.
-    time = int(recipe.get("time", 0) or 0)
-    if time and time <= 25:
-        score += 8
-    elif time and time <= 40:
-        score += 4
-    elif time and time >= 70:
+    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=10):
         score -= 5
 
-    # Лёгкое разнообразие по тексту: если блюдо явно очень специфичное и совпадает
-    # с предпочтениями, оно поднимется выше; если нет данных — останется обычный рандом.
-    if not active_profiles and not selected:
-        score += random.randint(0, 3)
+    time = int(recipe.get("time", 0) or 0)
+    if time and time <= 30:
+        score += 1
 
     return score
 
@@ -1892,7 +1865,6 @@ def format_weekly_menu(menu: dict[str, list[dict[str, Any]]]) -> str:
             icon = CATEGORY_TITLES.get(recipe.get("category"), "🍽").split()[0]
             lines.append(f"{icon} {recipe['name']}")
         lines.append("")
-    lines.append("🧠 Меню собрано с учётом профилей, истории, оценок, холодильника и ограничений.")
     lines.append("🛒 Можно одной кнопкой добавить продукты в список покупок.")
     return "\n".join(lines).strip()
 
@@ -2629,8 +2601,33 @@ async def start(message: Message):
 
 
 
+@dp.callback_query(F.data.startswith("onboarding:tour:"))
+async def onboarding_tour_callback(callback: CallbackQuery):
+    try:
+        page = int(callback.data.split(":")[-1])
+    except (ValueError, AttributeError):
+        page = 1
+    page = max(1, min(4, page))
+    await callback.message.edit_text(
+        onboarding_tour_text(page),
+        reply_markup=onboarding_tour_keyboard(page),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "onboarding:start")
 async def onboarding_start_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        onboarding_tour_text(1),
+        reply_markup=onboarding_tour_keyboard(1),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:profile")
+async def onboarding_profile_callback(callback: CallbackQuery):
     set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
     set_user_flag(callback.from_user.id, "awaiting_profile_name", "1")
     await callback.message.edit_text(
