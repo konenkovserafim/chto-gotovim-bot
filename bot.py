@@ -373,73 +373,20 @@ ONBOARDING_FLOW_KEY = "onboarding_flow_v1"
 def onboarding_intro_text() -> str:
     return (
         "🍽 <b>Добро пожаловать в «Что готовим?»</b>\n\n"
-        "Я помогу вам быстро решить главный вопрос: <b>что сегодня приготовить</b>.\n\n"
-        "Внутри есть рецепты, умный подбор, меню недели, холодильник, список покупок, "
-        "профили семьи, история и уведомления.\n\n"
-        "Сначала покажу, где что находится."
+        "Я помогу вам:\n\n"
+        "🥘 подобрать блюда\n"
+        "🛒 составить список покупок\n"
+        "📅 сделать меню недели\n"
+        "👨‍👩‍👧 учитывать вкусы всей семьи\n\n"
+        "Начнём?"
     )
 
 
 def onboarding_intro_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Начать обучение", callback_data="onboarding:tour:1")],
+        [InlineKeyboardButton(text="🚀 Начать", callback_data="onboarding:start")],
         [InlineKeyboardButton(text="Пропустить", callback_data="onboarding:skip")],
     ])
-
-
-def onboarding_tour_text(page: int) -> str:
-    pages = {
-        1: (
-            "1/4 · <b>Главные разделы</b>\n\n"
-            "🏠 <b>Главная</b> — вернуться на стартовый экран.\n"
-            "🍳 <b>Завтрак</b>, 🍲 <b>Обед</b>, 🍽 <b>Ужин</b>, 🥗 <b>Перекус</b> — открыть рецепты по разделам.\n"
-            "📅 <b>Меню недели</b> — составить план питания на 7 дней.\n"
-            "🔍 <b>Поиск</b> — найти блюдо по названию, продукту или фильтрам."
-        ),
-        2: (
-            "2/4 · <b>Рецепты и подбор</b>\n\n"
-            "✨ <b>Подобрать блюдо</b> на главном экране помогает выбрать вариант под текущее время дня.\n\n"
-            "В карточке рецепта можно:\n"
-            "✅ отметить, что приготовили;\n"
-            "⭐ поставить оценку;\n"
-            "❤️ добавить в избранное;\n"
-            "🛒 отправить продукты в список покупок."
-        ),
-        3: (
-            "3/4 · <b>Покупки и холодильник</b>\n\n"
-            "🥶 <b>Холодильник</b> — отметьте продукты, которые есть дома. "
-            "Так бот точнее подберёт блюда.\n\n"
-            "🛒 <b>Список продуктов</b> — сюда попадают ингредиенты из рецептов и меню недели.\n\n"
-            "📅 В меню недели можно одной кнопкой добавить продукты сразу на несколько дней."
-        ),
-        4: (
-            "4/4 · <b>Семья и настройки</b>\n\n"
-            "👥 <b>Профили</b> — добавьте участников семьи, их цели, предпочтения и ограничения.\n"
-            "👨‍👩‍👧 <b>Семья</b> — выберите, для кого готовим.\n"
-            "🔔 <b>Уведомления</b> — напоминания о завтраке, обеде и ужине.\n"
-            "📖 <b>История</b> — блюда, которые вы уже готовили.\n\n"
-            "Теперь можно создать первый профиль."
-        ),
-    }
-    return pages.get(page, pages[1])
-
-
-def onboarding_tour_keyboard(page: int) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    nav: list[InlineKeyboardButton] = []
-    if page > 1:
-        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"onboarding:tour:{page - 1}"))
-    if page < 4:
-        nav.append(InlineKeyboardButton(text="Дальше ➡️", callback_data=f"onboarding:tour:{page + 1}"))
-    if nav:
-        rows.append(nav)
-
-    if page < 4:
-        rows.append([InlineKeyboardButton(text="Пропустить обучение", callback_data="onboarding:profile")])
-    else:
-        rows.append([InlineKeyboardButton(text="👤 Создать первый профиль", callback_data="onboarding:profile")])
-        rows.append([InlineKeyboardButton(text="Пропустить профиль", callback_data="onboarding:notifications")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def onboarding_profile_prompt_text() -> str:
@@ -449,6 +396,30 @@ def onboarding_profile_prompt_text() -> str:
         "Введите имя профиля одним сообщением.\n\n"
         "Например: <b>Серафим</b> или <b>Таня</b>."
     )
+
+
+def onboarding_preferences_prompt_text(profile_name: str) -> str:
+    return (
+        "❤️ <b>Предпочтения</b>\n\n"
+        f"Что любит <b>{profile_name}</b>?\n\n"
+        "Напишите любимые продукты, блюда или кухни через запятую.\n\n"
+        "Например: <b>курица, паста, сырники, итальянская кухня</b>."
+    )
+
+
+def onboarding_restrictions_prompt_text(profile_name: str) -> str:
+    return (
+        "🚫 <b>Ограничения</b>\n\n"
+        f"Что <b>{profile_name}</b> не ест или не любит?\n\n"
+        "Напишите продукты через запятую.\n\n"
+        "Например: <b>свинина, грибы, морепродукты, острое</b>."
+    )
+
+
+def onboarding_skip_profile_step_keyboard(step: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустить", callback_data=f"onboarding:skip_{step}")],
+    ])
 
 
 def onboarding_add_more_text() -> str:
@@ -509,6 +480,9 @@ def set_onboarding_completed(user_id: int) -> None:
     set_user_flag(user_id, ONBOARDING_DONE_KEY, "1")
     delete_user_flag(user_id, ONBOARDING_FLOW_KEY)
     delete_user_flag(user_id, "awaiting_profile_name")
+    delete_user_flag(user_id, "awaiting_onboarding_preferences")
+    delete_user_flag(user_id, "awaiting_onboarding_restrictions")
+    delete_user_flag(user_id, "onboarding_current_profile")
 
 NOTIFICATION_DEFAULT_TIMES = {
     "breakfast": "09:00",
@@ -2601,33 +2575,8 @@ async def start(message: Message):
 
 
 
-@dp.callback_query(F.data.startswith("onboarding:tour:"))
-async def onboarding_tour_callback(callback: CallbackQuery):
-    try:
-        page = int(callback.data.split(":")[-1])
-    except (ValueError, AttributeError):
-        page = 1
-    page = max(1, min(4, page))
-    await callback.message.edit_text(
-        onboarding_tour_text(page),
-        reply_markup=onboarding_tour_keyboard(page),
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
 @dp.callback_query(F.data == "onboarding:start")
 async def onboarding_start_callback(callback: CallbackQuery):
-    await callback.message.edit_text(
-        onboarding_tour_text(1),
-        reply_markup=onboarding_tour_keyboard(1),
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "onboarding:profile")
-async def onboarding_profile_callback(callback: CallbackQuery):
     set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
     set_user_flag(callback.from_user.id, "awaiting_profile_name", "1")
     await callback.message.edit_text(
@@ -2654,9 +2603,46 @@ async def onboarding_add_profile_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "onboarding:skip_preferences")
+async def onboarding_skip_preferences_callback(callback: CallbackQuery):
+    code = get_user_flag(callback.from_user.id, "onboarding_current_profile")
+    profile = get_profile(callback.from_user.id, code) if code else None
+    if not profile:
+        await callback.answer("Профиль не найден", show_alert=True)
+        return
+
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    set_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions", "1")
+    await callback.message.edit_text(
+        onboarding_restrictions_prompt_text(profile["name"]),
+        reply_markup=onboarding_skip_profile_step_keyboard("restrictions"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:skip_restrictions")
+async def onboarding_skip_restrictions_callback(callback: CallbackQuery):
+    code = get_user_flag(callback.from_user.id, "onboarding_current_profile")
+    profile = get_profile(callback.from_user.id, code) if code else None
+
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
+    delete_user_flag(callback.from_user.id, "onboarding_current_profile")
+
+    await callback.message.edit_text(
+        onboarding_add_more_text(),
+        reply_markup=onboarding_add_more_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "onboarding:notifications")
 async def onboarding_notifications_callback(callback: CallbackQuery):
     delete_user_flag(callback.from_user.id, "awaiting_profile_name")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
+    delete_user_flag(callback.from_user.id, "onboarding_current_profile")
     await callback.message.edit_text(
         onboarding_notifications_text(),
         reply_markup=onboarding_notifications_keyboard(),
@@ -3629,17 +3615,61 @@ async def fallback(message: Message):
             return
         code = add_profile_db(message.from_user.id, name)
         delete_user_flag(message.from_user.id, "awaiting_profile_name")
+        profile = get_profile(message.from_user.id, code)
+
         if get_user_flag(message.from_user.id, ONBOARDING_FLOW_KEY) == "1":
+            set_user_flag(message.from_user.id, "onboarding_current_profile", code)
+            set_user_flag(message.from_user.id, "awaiting_onboarding_preferences", "1")
             await message.answer(
-                onboarding_add_more_text(),
-                reply_markup=onboarding_add_more_keyboard(),
+                onboarding_preferences_prompt_text(profile["name"]),
+                reply_markup=onboarding_skip_profile_step_keyboard("preferences"),
                 parse_mode="HTML",
             )
             return
-        profile = get_profile(message.from_user.id, code)
+
         await message.answer(
             profile_detail_text(profile),
             reply_markup=profile_detail_keyboard(code),
+            parse_mode="HTML",
+        )
+        return
+
+    if message.text and get_user_flag(message.from_user.id, "awaiting_onboarding_preferences") == "1":
+        code = get_user_flag(message.from_user.id, "onboarding_current_profile")
+        profile = get_profile(message.from_user.id, code) if code else None
+        if not profile:
+            delete_user_flag(message.from_user.id, "awaiting_onboarding_preferences")
+            delete_user_flag(message.from_user.id, "onboarding_current_profile")
+            await message.answer("Профиль не найден. Попробуйте создать профиль ещё раз.")
+            return
+
+        value = message.text.strip()
+        update_profile_field_db(message.from_user.id, code, "preferences", value)
+        delete_user_flag(message.from_user.id, "awaiting_onboarding_preferences")
+        set_user_flag(message.from_user.id, "awaiting_onboarding_restrictions", "1")
+        await message.answer(
+            onboarding_restrictions_prompt_text(profile["name"]),
+            reply_markup=onboarding_skip_profile_step_keyboard("restrictions"),
+            parse_mode="HTML",
+        )
+        return
+
+    if message.text and get_user_flag(message.from_user.id, "awaiting_onboarding_restrictions") == "1":
+        code = get_user_flag(message.from_user.id, "onboarding_current_profile")
+        profile = get_profile(message.from_user.id, code) if code else None
+        if not profile:
+            delete_user_flag(message.from_user.id, "awaiting_onboarding_restrictions")
+            delete_user_flag(message.from_user.id, "onboarding_current_profile")
+            await message.answer("Профиль не найден. Попробуйте создать профиль ещё раз.")
+            return
+
+        value = message.text.strip()
+        update_profile_field_db(message.from_user.id, code, "restrictions", value)
+        delete_user_flag(message.from_user.id, "awaiting_onboarding_restrictions")
+        delete_user_flag(message.from_user.id, "onboarding_current_profile")
+        await message.answer(
+            onboarding_add_more_text(),
+            reply_markup=onboarding_add_more_keyboard(),
             parse_mode="HTML",
         )
         return
