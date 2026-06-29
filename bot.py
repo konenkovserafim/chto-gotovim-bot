@@ -398,30 +398,6 @@ def onboarding_profile_prompt_text() -> str:
     )
 
 
-def onboarding_preferences_prompt_text(profile_name: str) -> str:
-    return (
-        "❤️ <b>Предпочтения</b>\n\n"
-        f"Что любит <b>{profile_name}</b>?\n\n"
-        "Напишите любимые продукты, блюда или кухни через запятую.\n\n"
-        "Например: <b>курица, паста, сырники, итальянская кухня</b>."
-    )
-
-
-def onboarding_restrictions_prompt_text(profile_name: str) -> str:
-    return (
-        "🚫 <b>Ограничения</b>\n\n"
-        f"Что <b>{profile_name}</b> не ест или не любит?\n\n"
-        "Напишите продукты через запятую.\n\n"
-        "Например: <b>свинина, грибы, морепродукты, острое</b>."
-    )
-
-
-def onboarding_skip_profile_step_keyboard(step: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Пропустить", callback_data=f"onboarding:skip_{step}")],
-    ])
-
-
 def onboarding_add_more_text() -> str:
     return (
         "✅ <b>Профиль создан.</b>\n\n"
@@ -480,9 +456,6 @@ def set_onboarding_completed(user_id: int) -> None:
     set_user_flag(user_id, ONBOARDING_DONE_KEY, "1")
     delete_user_flag(user_id, ONBOARDING_FLOW_KEY)
     delete_user_flag(user_id, "awaiting_profile_name")
-    delete_user_flag(user_id, "awaiting_onboarding_preferences")
-    delete_user_flag(user_id, "awaiting_onboarding_restrictions")
-    delete_user_flag(user_id, "onboarding_current_profile")
 
 NOTIFICATION_DEFAULT_TIMES = {
     "breakfast": "09:00",
@@ -1676,60 +1649,222 @@ def family_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 
-def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int]) -> int:
-    """Простая оценка для меню недели: холодильник, избранное, оценки, история и разнообразие."""
+def normalize_match_term(value: str) -> str:
+    return (value or "").lower().replace("ё", "е").strip()
+
+
+def term_aliases(term: str) -> list[str]:
+    """Небольшая нормализация для ограничений и предпочтений.
+
+    Пользователь пишет обычными словами: "курица, сыр".
+    В рецептах же может быть "куриная грудка", "куриное филе".
+    Поэтому для частых продуктов используем корни слов.
+    """
+    normalized = normalize_match_term(term)
+    aliases_map = {
+        "курица": ["куриц", "курин"],
+        "курицу": ["куриц", "курин"],
+        "куриное": ["куриц", "курин"],
+        "куриный": ["куриц", "курин"],
+        "сыр": ["сыр"],
+        "свинина": ["свинин", "свин"],
+        "свинину": ["свинин", "свин"],
+        "грибы": ["гриб", "шампин"],
+        "гриб": ["гриб", "шампин"],
+        "молоко": ["молок"],
+        "рыба": ["рыб"],
+        "морепродукты": ["кревет", "морепродукт"],
+        "креветки": ["кревет"],
+        "говядина": ["говядин", "говяж"],
+        "фарш": ["фарш"],
+        "яйца": ["яйц", "омлет", "яичниц"],
+        "яйцо": ["яйц", "омлет", "яичниц"],
+        "помидоры": ["помид", "томат"],
+        "томат": ["помид", "томат"],
+        "картофель": ["картоф", "пюре"],
+        "картошка": ["картоф", "пюре"],
+        "рис": ["рис"],
+        "гречка": ["греч"],
+        "макароны": ["макарон", "паста", "спагетти"],
+        "паста": ["макарон", "паста", "спагетти"],
+        "творог": ["творог", "творож"],
+    }
+    if normalized in aliases_map:
+        return aliases_map[normalized]
+    if len(normalized) > 4:
+        return [normalized, normalized[:5]]
+    return [normalized]
+
+
+def get_family_terms(user_id: int) -> tuple[list[str], list[str], list[str], str]:
+    active_profiles, active_names = _active_family_summary(user_id)
+    preference_terms: list[str] = []
+    restriction_terms: list[str] = []
+    goals: list[str] = []
+
+    for profile in active_profiles:
+        if family_consider_enabled(user_id, "prefs"):
+            preference_terms.extend(_split_profile_terms(profile.get("preferences")))
+        if family_consider_enabled(user_id, "limits"):
+            restriction_terms.extend(_split_profile_terms(profile.get("restrictions")))
+        if family_consider_enabled(user_id, "goals"):
+            goal = normalize_match_term(str(profile.get("goal") or ""))
+            if goal and goal not in goals:
+                goals.append(goal)
+
+    return (
+        list(dict.fromkeys(preference_terms)),
+        list(dict.fromkeys(restriction_terms)),
+        goals,
+        active_names,
+    )
+
+
+def recipe_main_theme(recipe: dict[str, Any]) -> str:
+    text = _recipe_text_for_matching(recipe)
+    themes = [
+        ("курица", ["куриц", "курин"]),
+        ("рыба", ["рыб", "тунец", "лосос", "семг", "форел"]),
+        ("говядина", ["говядин", "говяж"]),
+        ("свинина", ["свинин", "свин", "бекон", "ветчин"]),
+        ("фарш", ["фарш"]),
+        ("яйца", ["яйц", "омлет", "яичниц"]),
+        ("творог", ["творог", "творож"]),
+        ("сыр", ["сыр"]),
+        ("рис", ["рис"]),
+        ("гречка", ["греч"]),
+        ("макароны", ["макарон", "паста", "спагетти"]),
+        ("картофель", ["картоф", "пюре"]),
+        ("овощи", ["овощ", "помид", "огур", "капуст", "морков", "перец"]),
+    ]
+    for theme, aliases in themes:
+        if any(alias in text for alias in aliases):
+            return theme
+    return str(recipe.get("category") or "другое")
+
+
+def score_recipe_for_week(
+    recipe: dict[str, Any],
+    user_id: int,
+    used_ids: set[int],
+    used_themes: dict[str, int] | None = None,
+) -> int:
+    """Оценка блюда для меню недели.
+
+    Использует те же данные, что и умный подбор: семью, ограничения,
+    предпочтения, цели, холодильник, избранное, оценки и историю.
+    Дополнительно штрафует однообразие внутри недели.
+    """
     recipe_id = int(recipe.get("id", 0) or 0)
     score = 0
+    used_themes = used_themes or {}
+
+    preference_terms, restriction_terms, goals, active_names = get_family_terms(user_id)
 
     if recipe_id in used_ids:
-        score -= 100
+        score -= 10000
+
+    # Ограничения должны быть самым жёстким фактором.
+    blocked_terms = _matched_terms(recipe, restriction_terms)
+    if blocked_terms:
+        return -100000
+
+    if restriction_terms:
+        score += 50
+
+    matched_prefs = _matched_terms(recipe, preference_terms)
+    if matched_prefs:
+        score += 25 + min(20, len(matched_prefs) * 5)
+
+    calories = int(recipe.get("calories", 0) or 0)
+    for goal in goals:
+        if "похуд" in goal:
+            if calories and calories <= 700:
+                score += 20
+            elif calories and calories >= 1000:
+                score -= 25
+        elif "набор" in goal or "мас" in goal:
+            if calories and calories >= 700:
+                score += 15
+        elif "поддерж" in goal:
+            if calories and 450 <= calories <= 950:
+                score += 8
 
     selected = set(get_fridge_items(user_id))
     required = detected_product_codes(recipe)
-    if required:
+    if selected and required:
         matched = required & selected
         missing = required - selected
         if not missing:
-            score += 8
+            score += 35
         elif len(missing) <= 2:
-            score += 4
-        score += min(len(matched), 3)
+            score += 18 - len(missing) * 4
+        score += min(len(matched), 4) * 2
 
     if recipe_id in set(get_favorites(user_id)):
-        score += 3
+        score += 18
 
     rating = get_user_recipe_rating(user_id, recipe_id)
     if rating:
-        score += rating
+        score += rating * 4
+        if rating <= 2:
+            score -= 12
 
-    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=10):
-        score -= 5
+    if family_consider_enabled(user_id, "history") and recipe_id in get_recent_cooked_recipe_ids(user_id, limit=14):
+        score -= 45
+    elif recipe_id in get_recent_cooked_recipe_ids(user_id, limit=7):
+        score -= 25
 
     time = int(recipe.get("time", 0) or 0)
     if time and time <= 30:
-        score += 1
+        score += 6
+
+    # Разнообразие недели: если тема уже часто встречалась, сильно штрафуем.
+    theme = recipe_main_theme(recipe)
+    theme_count = used_themes.get(theme, 0)
+    if theme_count:
+        score -= theme_count * 28
 
     return score
 
 
-def pick_week_recipe(category: str, user_id: int, used_ids: set[int]) -> dict[str, Any] | None:
+def pick_week_recipe(
+    category: str,
+    user_id: int,
+    used_ids: set[int],
+    used_themes: dict[str, int] | None = None,
+) -> dict[str, Any] | None:
     candidates = recipes_for_category(category)
     if not candidates:
         return None
-    scored = [(score_recipe_for_week(r, user_id, used_ids), random.random(), r) for r in candidates]
+
+    used_themes = used_themes or {}
+    scored = [
+        (score_recipe_for_week(r, user_id, used_ids, used_themes), random.random(), r)
+        for r in candidates
+    ]
+
+    # Сначала берём только блюда, которые не нарушают ограничения.
+    valid_scored = [item for item in scored if item[0] > -100000]
+    if valid_scored:
+        scored = valid_scored
+
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     recipe = scored[0][2]
     used_ids.add(int(recipe["id"]))
+    theme = recipe_main_theme(recipe)
+    used_themes[theme] = used_themes.get(theme, 0) + 1
     return recipe
 
 
 def generate_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
     used_ids: set[int] = set()
+    used_themes: dict[str, int] = {}
     menu: dict[str, list[dict[str, Any]]] = {}
     for day in WEEK_DAYS:
         day_items: list[dict[str, Any]] = []
         for category in ["breakfast", "lunch", "dinner"]:
-            recipe = pick_week_recipe(category, user_id, used_ids)
+            recipe = pick_week_recipe(category, user_id, used_ids, used_themes)
             if recipe:
                 day_items.append(recipe)
         menu[day] = day_items
@@ -1739,7 +1874,6 @@ def generate_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
         json.dumps({day: [int(r["id"]) for r in items] for day, items in menu.items()}, ensure_ascii=False),
     )
     return menu
-
 
 def get_saved_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
     raw = get_user_flag(user_id, "weekly_menu_ids")
@@ -2358,9 +2492,12 @@ def _matched_terms(recipe: dict[str, Any], terms: list[str]) -> list[str]:
     text = _recipe_text_for_matching(recipe)
     matched: list[str] = []
     for term in terms:
-        normalized = term.lower().replace("ё", "е").strip()
-        if normalized and normalized in text and term not in matched:
-            matched.append(term)
+        normalized = normalize_match_term(term)
+        if not normalized:
+            continue
+        aliases = term_aliases(normalized)
+        if any(alias and alias in text for alias in aliases) and normalized not in matched:
+            matched.append(normalized)
     return matched
 
 
@@ -2603,46 +2740,9 @@ async def onboarding_add_profile_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data == "onboarding:skip_preferences")
-async def onboarding_skip_preferences_callback(callback: CallbackQuery):
-    code = get_user_flag(callback.from_user.id, "onboarding_current_profile")
-    profile = get_profile(callback.from_user.id, code) if code else None
-    if not profile:
-        await callback.answer("Профиль не найден", show_alert=True)
-        return
-
-    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
-    set_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions", "1")
-    await callback.message.edit_text(
-        onboarding_restrictions_prompt_text(profile["name"]),
-        reply_markup=onboarding_skip_profile_step_keyboard("restrictions"),
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "onboarding:skip_restrictions")
-async def onboarding_skip_restrictions_callback(callback: CallbackQuery):
-    code = get_user_flag(callback.from_user.id, "onboarding_current_profile")
-    profile = get_profile(callback.from_user.id, code) if code else None
-
-    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
-    delete_user_flag(callback.from_user.id, "onboarding_current_profile")
-
-    await callback.message.edit_text(
-        onboarding_add_more_text(),
-        reply_markup=onboarding_add_more_keyboard(),
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
 @dp.callback_query(F.data == "onboarding:notifications")
 async def onboarding_notifications_callback(callback: CallbackQuery):
     delete_user_flag(callback.from_user.id, "awaiting_profile_name")
-    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
-    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
-    delete_user_flag(callback.from_user.id, "onboarding_current_profile")
     await callback.message.edit_text(
         onboarding_notifications_text(),
         reply_markup=onboarding_notifications_keyboard(),
@@ -3615,61 +3715,17 @@ async def fallback(message: Message):
             return
         code = add_profile_db(message.from_user.id, name)
         delete_user_flag(message.from_user.id, "awaiting_profile_name")
-        profile = get_profile(message.from_user.id, code)
-
         if get_user_flag(message.from_user.id, ONBOARDING_FLOW_KEY) == "1":
-            set_user_flag(message.from_user.id, "onboarding_current_profile", code)
-            set_user_flag(message.from_user.id, "awaiting_onboarding_preferences", "1")
             await message.answer(
-                onboarding_preferences_prompt_text(profile["name"]),
-                reply_markup=onboarding_skip_profile_step_keyboard("preferences"),
+                onboarding_add_more_text(),
+                reply_markup=onboarding_add_more_keyboard(),
                 parse_mode="HTML",
             )
             return
-
+        profile = get_profile(message.from_user.id, code)
         await message.answer(
             profile_detail_text(profile),
             reply_markup=profile_detail_keyboard(code),
-            parse_mode="HTML",
-        )
-        return
-
-    if message.text and get_user_flag(message.from_user.id, "awaiting_onboarding_preferences") == "1":
-        code = get_user_flag(message.from_user.id, "onboarding_current_profile")
-        profile = get_profile(message.from_user.id, code) if code else None
-        if not profile:
-            delete_user_flag(message.from_user.id, "awaiting_onboarding_preferences")
-            delete_user_flag(message.from_user.id, "onboarding_current_profile")
-            await message.answer("Профиль не найден. Попробуйте создать профиль ещё раз.")
-            return
-
-        value = message.text.strip()
-        update_profile_field_db(message.from_user.id, code, "preferences", value)
-        delete_user_flag(message.from_user.id, "awaiting_onboarding_preferences")
-        set_user_flag(message.from_user.id, "awaiting_onboarding_restrictions", "1")
-        await message.answer(
-            onboarding_restrictions_prompt_text(profile["name"]),
-            reply_markup=onboarding_skip_profile_step_keyboard("restrictions"),
-            parse_mode="HTML",
-        )
-        return
-
-    if message.text and get_user_flag(message.from_user.id, "awaiting_onboarding_restrictions") == "1":
-        code = get_user_flag(message.from_user.id, "onboarding_current_profile")
-        profile = get_profile(message.from_user.id, code) if code else None
-        if not profile:
-            delete_user_flag(message.from_user.id, "awaiting_onboarding_restrictions")
-            delete_user_flag(message.from_user.id, "onboarding_current_profile")
-            await message.answer("Профиль не найден. Попробуйте создать профиль ещё раз.")
-            return
-
-        value = message.text.strip()
-        update_profile_field_db(message.from_user.id, code, "restrictions", value)
-        delete_user_flag(message.from_user.id, "awaiting_onboarding_restrictions")
-        delete_user_flag(message.from_user.id, "onboarding_current_profile")
-        await message.answer(
-            onboarding_add_more_text(),
-            reply_markup=onboarding_add_more_keyboard(),
             parse_mode="HTML",
         )
         return
