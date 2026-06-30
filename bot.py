@@ -4,6 +4,8 @@ import logging
 import os
 import random
 import sqlite3
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -30,7 +32,9 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Add it in Railway Variables.")
 
 RECIPES_PATH = Path("recipes.json")
-DB_PATH = Path("bot_data.db")
+DB_PATH = Path(os.getenv("DB_PATH", "bot_data.db"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+USE_POSTGRES = bool(DATABASE_URL)
 PAGE_SIZE = 8
 
 CATEGORY_TITLES = {
@@ -137,7 +141,98 @@ def load_recipes_from_json() -> list[dict[str, Any]]:
         return json.load(f)
 
 
-def db_connect() -> sqlite3.Connection:
+def _ensure_psycopg2():
+    try:
+        import psycopg2  # type: ignore
+        from psycopg2.extras import RealDictCursor  # type: ignore
+        return psycopg2, RealDictCursor
+    except ImportError:
+        logger.warning("psycopg2-binary is not installed. Installing at runtime...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "psycopg2-binary"])
+        import psycopg2  # type: ignore
+        from psycopg2.extras import RealDictCursor  # type: ignore
+        return psycopg2, RealDictCursor
+
+
+class _PgCursorResult:
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.rowcount = cursor.rowcount
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+
+class _PgConnection:
+    def __init__(self):
+        psycopg2, RealDictCursor = _ensure_psycopg2()
+        self._conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self._conn.rollback()
+        else:
+            self._conn.commit()
+        self._conn.close()
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def execute(self, query: str, params: tuple = ()):  # sqlite-compatible wrapper
+        sql = self._translate_sql(query)
+        cur = self._conn.cursor()
+        cur.execute(sql, params)
+        return _PgCursorResult(cur)
+
+    def _translate_sql(self, query: str) -> str:
+        q = query.strip()
+        lower = " ".join(q.lower().split())
+
+        if lower == "pragma table_info(household_profiles)":
+            return "SELECT column_name AS name FROM information_schema.columns WHERE table_name = 'household_profiles'"
+
+        q = q.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+        q = q.replace("COLLATE NOCASE", "")
+
+        if "insert or ignore into" in lower:
+            q = q.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+            q = q.replace("insert or ignore into", "insert into")
+            q += " ON CONFLICT DO NOTHING"
+
+        if "insert or replace into recipes" in lower:
+            q = q.replace("INSERT OR REPLACE INTO", "INSERT INTO")
+            q += """
+                ON CONFLICT (id) DO UPDATE SET
+                    category = EXCLUDED.category,
+                    name = EXCLUDED.name,
+                    time = EXCLUDED.time,
+                    difficulty = EXCLUDED.difficulty,
+                    price = EXCLUDED.price,
+                    calories = EXCLUDED.calories,
+                    ingredients_json = EXCLUDED.ingredients_json,
+                    steps_json = EXCLUDED.steps_json,
+                    tags_json = EXCLUDED.tags_json
+            """
+        elif "insert or replace into user_flags" in lower:
+            q = q.replace("INSERT OR REPLACE INTO", "INSERT INTO")
+            q += " ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value"
+        elif "insert or replace into recipe_ratings" in lower:
+            q = q.replace("INSERT OR REPLACE INTO", "INSERT INTO")
+            q += " ON CONFLICT (user_id, recipe_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = EXCLUDED.rated_at"
+
+        q = q.replace("?", "%s")
+        return q
+
+
+def db_connect():
+    if USE_POSTGRES:
+        return _PgConnection()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -1993,196 +2088,26 @@ def add_weekly_menu_to_shopping(user_id: int) -> int:
     return added
 
 
-
-def ingredient_weight_grams(name: str, amount: float, unit: str) -> float | None:
-    """Очень примерная оценка веса ингредиента для расчёта порций."""
-    name_low = normalize_text(name)
-    unit_low = normalize_text(unit)
-
-    if unit_low in {"г", "гр", "гр.", "грамм", "граммов"}:
-        return amount
-    if unit_low in {"кг", "килограмм", "килограммов"}:
-        return amount * 1000
-    if unit_low in {"мл", "мл."}:
-        return amount
-    if unit_low in {"л", "литр", "литра", "литров"}:
-        return amount * 1000
-    if "ст" in unit_low and "л" in unit_low:
-        return amount * 15
-    if "ч" in unit_low and "л" in unit_low:
-        return amount * 5
-    if "шт" in unit_low or "штук" in unit_low:
-        if "яйц" in name_low:
-            return amount * 50
-        if "лук" in name_low:
-            return amount * 80
-        if "помид" in name_low or "томат" in name_low:
-            return amount * 90
-        if "огур" in name_low:
-            return amount * 100
-        if "картоф" in name_low:
-            return amount * 140
-        if "морков" in name_low:
-            return amount * 80
-        if "банан" in name_low:
-            return amount * 120
-        if "яблок" in name_low:
-            return amount * 150
-        return amount * 100
-    return None
-
-
-def ingredient_macro_per_100(name: str) -> tuple[float, float, float, float] | None:
-    """Возвращает примерные КБЖУ на 100 г: ккал, белки, жиры, углеводы."""
-    n = normalize_text(name)
-    rules: list[tuple[list[str], tuple[float, float, float, float]]] = [
-        (["куриц", "филе", "грудк"], (120, 23, 2, 0)),
-        (["индейк"], (115, 22, 2, 0)),
-        (["говядин", "фарш"], (220, 18, 16, 0)),
-        (["свинин"], (260, 16, 22, 0)),
-        (["рыб", "тунец", "лосос", "семг", "форел"], (150, 20, 7, 0)),
-        (["яйц", "омлет", "яичниц"], (155, 13, 11, 1)),
-        (["сыр"], (350, 24, 28, 2)),
-        (["творог"], (140, 18, 5, 3)),
-        (["молоко", "кефир", "йогурт"], (60, 3, 3, 5)),
-        (["сметан", "сливк"], (200, 3, 20, 4)),
-        (["сливочное масло", "масло слив"], (750, 1, 82, 1)),
-        (["растительное масло", "масло"], (900, 0, 100, 0)),
-        (["рис"], (340, 7, 1, 75)),
-        (["греч"], (330, 13, 3, 68)),
-        (["макарон", "паста", "спагетти"], (350, 12, 2, 72)),
-        (["овсян", "хлопья"], (370, 13, 7, 60)),
-        (["мука"], (340, 10, 1, 70)),
-        (["хлеб", "лаваш"], (250, 8, 3, 50)),
-        (["картоф"], (80, 2, 0, 17)),
-        (["помид", "томат", "огур", "лук", "морков", "капуст", "перец", "кабач", "баклаж", "овощ", "зелень"], (35, 1, 0, 7)),
-        (["банан"], (90, 1, 0, 22)),
-        (["яблок"], (50, 0, 0, 12)),
-        (["сахар", "мед", "мёд"], (390, 0, 0, 98)),
-        (["фасол", "горох", "нут"], (300, 20, 2, 45)),
-    ]
-    for keys, macros in rules:
-        if any(key in n for key in keys):
-            return macros
-    return None
-
-
-def estimate_recipe_nutrition(recipe: dict[str, Any]) -> dict[str, int]:
-    """Примерно оценивает вес и КБЖУ всего блюда."""
-    total_weight = 0.0
-    protein = fat = carbs = calories_from_ingredients = 0.0
-
-    for ingredient in recipe.get("ingredients", []):
-        parsed = parse_ingredient_line(str(ingredient))
-        if not parsed:
-            continue
-        name, amount, unit = parsed
-        grams = ingredient_weight_grams(name, amount, unit)
-        if not grams:
-            continue
-        total_weight += grams
-        macros = ingredient_macro_per_100(name)
-        if macros:
-            kcal100, p100, f100, c100 = macros
-            factor = grams / 100
-            calories_from_ingredients += kcal100 * factor
-            protein += p100 * factor
-            fat += f100 * factor
-            carbs += c100 * factor
-
-    recipe_calories = int(recipe.get("calories", 0) or 0)
-    total_calories = recipe_calories or int(round(calories_from_ingredients))
-
-    # Если КБЖУ удалось примерно посчитать, масштабируем их под калорийность рецепта из базы.
-    if total_calories and calories_from_ingredients > 0 and (protein or fat or carbs):
-        scale = total_calories / calories_from_ingredients
-        protein *= scale
-        fat *= scale
-        carbs *= scale
-    elif total_calories:
-        # Запасной вариант: среднее распределение калорий.
-        protein = total_calories * 0.20 / 4
-        fat = total_calories * 0.30 / 9
-        carbs = total_calories * 0.50 / 4
-
-    if not total_weight and total_calories:
-        # Очень грубая оценка, чтобы не показывать 0 г.
-        total_weight = total_calories * 1.2
-
-    return {
-        "weight": int(round(total_weight)) if total_weight else 0,
-        "calories": int(round(total_calories)) if total_calories else 0,
-        "protein": int(round(protein)) if protein else 0,
-        "fat": int(round(fat)) if fat else 0,
-        "carbs": int(round(carbs)) if carbs else 0,
-    }
-
-
-def active_profiles_for_portions(user_id: int) -> list[dict[str, Any]]:
-    profiles = family_active_profiles(user_id)
-    return profiles or get_profiles(user_id)
-
-
-def profile_calorie_weight(profile: dict[str, Any]) -> float:
-    calories = float(profile.get("calories") or 0)
-    if calories > 0:
-        return calories
-    factor = float(profile.get("portion_factor") or 1.0)
-    return max(factor, 0.1) * 2000
-
-
 def format_portions(recipe: dict[str, Any], user_id: int) -> str:
-    profiles = active_profiles_for_portions(user_id)
+    profiles = get_profiles(user_id)
     if not profiles:
         return (
             "👥 <b>Порции</b>\n\n"
             "Профилей пока нет. Создайте профиль в разделе 👥 Профили, "
             "и потом бот сможет учитывать участников семьи."
         )
-
-    nutrition = estimate_recipe_nutrition(recipe)
-    total_weight = nutrition["weight"]
-    total_cal = nutrition["calories"]
-    total_p = nutrition["protein"]
-    total_f = nutrition["fat"]
-    total_c = nutrition["carbs"]
-
-    weights = [profile_calorie_weight(profile) for profile in profiles]
-    total_profile_weight = sum(weights) or len(profiles)
-
-    lines = [f"👥 <b>Порции: {recipe['name']}</b>", ""]
-    if total_weight:
-        lines.append(f"🍽 Общий вес блюда: <b>~{total_weight} г</b>")
-    if total_cal:
-        lines.append("<b>КБЖУ всего блюда:</b>")
-        lines.append(f"🔥 {total_cal} ккал")
-        lines.append(f"🥩 Б: {total_p} г  🧈 Ж: {total_f} г  🍚 У: {total_c} г")
-    lines.append("")
-
-    for profile, weight in zip(profiles, weights):
-        share = weight / total_profile_weight if total_profile_weight else 1 / len(profiles)
-        percent = int(round(share * 100))
-        portion_weight = int(round(total_weight * share)) if total_weight else 0
-        portion_cal = int(round(total_cal * share)) if total_cal else 0
-        portion_p = int(round(total_p * share)) if total_p else 0
-        portion_f = int(round(total_f * share)) if total_f else 0
-        portion_c = int(round(total_c * share)) if total_c else 0
-
-        goal = clean_profile_value(profile.get("goal"), "цель не указана")
-        calories_norm = int(profile.get("calories") or 0)
-
-        lines.append(f"👤 <b>{profile['name']}</b> — <b>{percent}%</b>")
-        if calories_norm:
-            lines.append(f"🎯 {goal}, норма: {calories_norm} ккал")
-        if portion_weight:
-            lines.append(f"🍽 Порция: <b>~{portion_weight} г</b>")
-        if portion_cal:
-            lines.append(f"🔥 ~{portion_cal} ккал")
-            lines.append(f"🥩 Б: {portion_p} г  🧈 Ж: {portion_f} г  🍚 У: {portion_c} г")
+    total_cal = int(recipe.get("calories", 0) or 0)
+    lines = [f"👥 <b>Порции: {recipe['name']}</b>", "", "Расчёт примерный: рецепт делится между профилями по долям.", ""]
+    factor = 1 / max(len(profiles), 1)
+    for p in profiles:
+        kcal = int(round(total_cal * factor)) if total_cal else 0
+        lines.append(f"👤 <b>{p['name']}</b> — примерно {int(round(factor * 100))}%")
+        if kcal:
+            lines.append(f"🔥 ~{kcal} ккал")
+        for item in recipe.get("ingredients", [])[:12]:
+            lines.append(f"• {scale_ingredient_text(item, factor)}")
         lines.append("")
-
-    lines.append("Расчёт примерный: блюдо делится по долям от нормы калорий профилей.")
-    lines.append("🛒 В список покупок добавляются общие ингредиенты рецепта.")
+    lines.append("🛒 В список покупок всё равно добавляются общие ингредиенты.")
     return "\n".join(lines)
 
 
