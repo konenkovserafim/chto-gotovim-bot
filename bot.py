@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ if not BOT_TOKEN:
 
 RECIPES_PATH = Path("recipes.json")
 DB_PATH = Path("bot_data.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 PAGE_SIZE = 8
 
 CATEGORY_TITLES = {
@@ -137,7 +139,103 @@ def load_recipes_from_json() -> list[dict[str, Any]]:
         return json.load(f)
 
 
-def db_connect() -> sqlite3.Connection:
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
+
+
+class PostgresConnection:
+    """Мини-адаптер, чтобы старый код с conn.execute(...) работал с PostgreSQL."""
+
+    def __init__(self, url: str):
+        if psycopg2 is None:
+            raise RuntimeError(
+                "DATABASE_URL is set, but psycopg2-binary is not installed. "
+                "Add psycopg2-binary to requirements.txt."
+            )
+        self.conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self.conn.rollback()
+        else:
+            self.conn.commit()
+        self.conn.close()
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def execute(self, sql: str, params: tuple = ()):
+        sql = sql.strip()
+
+        pragma_match = re.match(r"PRAGMA\s+table_info\((\w+)\)", sql, re.IGNORECASE)
+        if pragma_match:
+            table_name = pragma_match.group(1)
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT column_name AS name
+                FROM information_schema.columns
+                WHERE table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table_name,),
+            )
+            return cur
+
+        converted = self._convert_sql(sql)
+        cur = self.conn.cursor()
+        cur.execute(converted, params)
+        return cur
+
+    def _convert_sql(self, sql: str) -> str:
+        sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+        sql = re.sub(r"\buser_id\s+INTEGER\b", "user_id BIGINT", sql)
+        sql = sql.replace("ORDER BY name COLLATE NOCASE", "ORDER BY LOWER(name)")
+
+        if sql.startswith("INSERT OR REPLACE INTO recipes"):
+            sql = sql.replace("INSERT OR REPLACE INTO recipes", "INSERT INTO recipes", 1)
+            sql += """
+            ON CONFLICT (id) DO UPDATE SET
+                category = EXCLUDED.category,
+                name = EXCLUDED.name,
+                time = EXCLUDED.time,
+                difficulty = EXCLUDED.difficulty,
+                price = EXCLUDED.price,
+                calories = EXCLUDED.calories,
+                ingredients_json = EXCLUDED.ingredients_json,
+                steps_json = EXCLUDED.steps_json,
+                tags_json = EXCLUDED.tags_json
+            """
+
+        if sql.startswith("INSERT OR REPLACE INTO user_flags"):
+            sql = sql.replace("INSERT OR REPLACE INTO user_flags", "INSERT INTO user_flags", 1)
+            sql += " ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value"
+
+        if sql.startswith("INSERT OR REPLACE INTO recipe_ratings"):
+            sql = sql.replace("INSERT OR REPLACE INTO recipe_ratings", "INSERT INTO recipe_ratings", 1)
+            sql += """
+            ON CONFLICT (user_id, recipe_id) DO UPDATE SET
+                rating = EXCLUDED.rating,
+                rated_at = EXCLUDED.rated_at
+            """
+
+        if sql.startswith("INSERT OR IGNORE INTO"):
+            sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1)
+            sql += " ON CONFLICT DO NOTHING"
+
+        sql = sql.replace("?", "%s")
+        return sql
+
+
+def db_connect():
+    if DATABASE_URL:
+        return PostgresConnection(DATABASE_URL)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -209,6 +307,21 @@ def init_db() -> None:
         for column_name, column_type in profile_columns_to_add.items():
             if column_name not in existing_profile_columns:
                 conn.execute(f"ALTER TABLE household_profiles ADD COLUMN {column_name} {column_type}")
+
+        if DATABASE_URL:
+            for table_name in (
+                "favorites",
+                "shopping_items",
+                "fridge_items",
+                "household_profiles",
+                "user_flags",
+                "cooking_history",
+                "recipe_ratings",
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE {table_name} ALTER COLUMN user_id TYPE BIGINT")
+                except Exception:
+                    pass
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_flags (
@@ -386,6 +499,79 @@ def onboarding_intro_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Начать", callback_data="onboarding:start")],
         [InlineKeyboardButton(text="Пропустить", callback_data="onboarding:skip")],
+    ])
+
+
+
+def onboarding_tour_text(step: int) -> str:
+    pages = {
+        1: (
+            "🎓 <b>Как устроен бот</b>\n\n"
+            "Внизу есть главное меню. Через него можно быстро открыть любой раздел.\n\n"
+            "🍳 <b>Завтрак</b>, 🍲 <b>Обед</b>, 🍽 <b>Ужин</b>, 🥗 <b>Перекус</b>\n"
+            "Открывают списки рецептов по разделам."
+        ),
+        2: (
+            "🔍 <b>Поиск и рецепты</b>\n\n"
+            "В <b>Поиске</b> можно найти блюдо по названию или продуктам.\n\n"
+            "В карточке рецепта можно:\n"
+            "✅ отметить, что приготовили\n"
+            "⭐ поставить оценку\n"
+            "❤️ добавить в избранное\n"
+            "🛒 отправить ингредиенты в покупки\n"
+            "👥 посмотреть порции для семьи"
+        ),
+        3: (
+            "📅 <b>Меню недели и покупки</b>\n\n"
+            "<b>Меню недели</b> собирает план на несколько дней.\n"
+            "Блюда можно заменить, пересобрать меню и одной кнопкой добавить продукты в список покупок.\n\n"
+            "🛒 <b>Список продуктов</b> — всё, что нужно купить."
+        ),
+        4: (
+            "👥 <b>Профили, семья и холодильник</b>\n\n"
+            "В <b>Профилях</b> хранятся цели, предпочтения и ограничения.\n"
+            "В <b>Семье</b> выбирается, для кого готовим.\n"
+            "В <b>Холодильнике</b> отмечаются продукты, которые уже есть дома.\n\n"
+            "Чем лучше заполнены эти разделы, тем точнее будут рекомендации."
+        ),
+    }
+    return pages.get(step, pages[1])
+
+
+def onboarding_tour_keyboard(step: int) -> InlineKeyboardMarkup:
+    if step < 4:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Дальше ➡️", callback_data=f"onboarding:tour:{step + 1}")],
+            [InlineKeyboardButton(text="Пропустить обучение", callback_data="onboarding:create_profile")],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Создать первый профиль", callback_data="onboarding:create_profile")],
+        [InlineKeyboardButton(text="Пропустить", callback_data="onboarding:notifications")],
+    ])
+
+
+def onboarding_preferences_prompt_text(profile_name: str) -> str:
+    return (
+        f"❤️ <b>Предпочтения</b>\n\n"
+        f"Профиль: <b>{profile_name}</b>\n\n"
+        "Напишите, что нравится или что хочется чаще видеть в рекомендациях.\n\n"
+        "Например: <b>курица, паста, сырники, итальянская кухня</b>."
+    )
+
+
+def onboarding_restrictions_prompt_text(profile_name: str) -> str:
+    return (
+        f"🚫 <b>Ограничения</b>\n\n"
+        f"Профиль: <b>{profile_name}</b>\n\n"
+        "Напишите, что не предлагать.\n\n"
+        "Например: <b>свинина, грибы, морепродукты, острое</b>.\n\n"
+        "Можно писать и обобщения: <b>мясное</b>, <b>молочное</b>, <b>рыба</b>."
+    )
+
+
+def onboarding_skip_step_keyboard(callback_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустить", callback_data=callback_data)],
     ])
 
 
@@ -1993,27 +2179,103 @@ def add_weekly_menu_to_shopping(user_id: int) -> int:
     return added
 
 
+def estimate_recipe_weight(recipe: dict[str, Any]) -> int:
+    """Очень примерная оценка веса готового блюда по ингредиентам."""
+    total = 0.0
+    for item in recipe.get("ingredients", []):
+        text_low = str(item).lower().replace(",", ".")
+        match = re.search(r"(\d+(?:\.\d+)?)", text_low)
+        if not match:
+            continue
+        value = float(match.group(1))
+        if any(unit in text_low for unit in ["кг"]):
+            total += value * 1000
+        elif any(unit in text_low for unit in ["г", "гр"]):
+            total += value
+        elif "мл" in text_low:
+            total += value
+        elif "л" in text_low and "ст. л" not in text_low and "ч. л" not in text_low:
+            total += value * 1000
+        elif "шт" in text_low:
+            total += value * 60
+        elif "ст. л" in text_low:
+            total += value * 15
+        elif "ч. л" in text_low:
+            total += value * 5
+    if total <= 0:
+        calories = int(recipe.get("calories", 0) or 0)
+        total = max(400, calories * 1.2) if calories else 700
+    return int(round(total))
+
+
+def estimate_macros(calories: int) -> tuple[int, int, int]:
+    """Примерная оценка БЖУ по калорийности, если в базе нет точных макросов."""
+    if calories <= 0:
+        return 0, 0, 0
+    protein_kcal = calories * 0.22
+    fat_kcal = calories * 0.30
+    carb_kcal = calories * 0.48
+    protein = int(round(protein_kcal / 4))
+    fat = int(round(fat_kcal / 9))
+    carbs = int(round(carb_kcal / 4))
+    return protein, fat, carbs
+
+
 def format_portions(recipe: dict[str, Any], user_id: int) -> str:
-    profiles = get_profiles(user_id)
+    profiles = family_active_profiles(user_id) or get_profiles(user_id)
     if not profiles:
         return (
             "👥 <b>Порции</b>\n\n"
             "Профилей пока нет. Создайте профиль в разделе 👥 Профили, "
             "и потом бот сможет учитывать участников семьи."
         )
+
     total_cal = int(recipe.get("calories", 0) or 0)
-    lines = [f"👥 <b>Порции: {recipe['name']}</b>", "", "Расчёт примерный: рецепт делится между профилями по долям.", ""]
-    factor = 1 / max(len(profiles), 1)
-    for p in profiles:
-        kcal = int(round(total_cal * factor)) if total_cal else 0
-        lines.append(f"👤 <b>{p['name']}</b> — примерно {int(round(factor * 100))}%")
-        if kcal:
-            lines.append(f"🔥 ~{kcal} ккал")
-        for item in recipe.get("ingredients", [])[:12]:
-            lines.append(f"• {scale_ingredient_text(item, factor)}")
+    total_weight = estimate_recipe_weight(recipe)
+    total_p, total_f, total_c = estimate_macros(total_cal)
+
+    calorie_norms = []
+    for profile in profiles:
+        calories = int(profile.get("calories") or 0)
+        calorie_norms.append(max(calories, 0))
+
+    if sum(calorie_norms) <= 0:
+        calorie_norms = [1 for _ in profiles]
+
+    total_norm = sum(calorie_norms)
+
+    lines = [
+        f"👥 <b>Порции: {recipe['name']}</b>",
+        "",
+        f"🍽 Общий вес блюда: <b>~{total_weight} г</b>",
+    ]
+
+    if total_cal:
+        lines.extend([
+            f"🔥 Всего: <b>~{total_cal} ккал</b>",
+            f"🥩 Б: <b>~{total_p} г</b>  🧈 Ж: <b>~{total_f} г</b>  🍚 У: <b>~{total_c} г</b>",
+        ])
+
+    lines.append("")
+
+    for profile, norm in zip(profiles, calorie_norms):
+        share = norm / total_norm if total_norm else 1 / len(profiles)
+        percent = int(round(share * 100))
+        portion_weight = int(round(total_weight * share))
+        portion_cal = int(round(total_cal * share)) if total_cal else 0
+        p = int(round(total_p * share))
+        f = int(round(total_f * share))
+        c = int(round(total_c * share))
+
+        lines.append(f"👤 <b>{profile['name']}</b> — <b>{percent}%</b>")
+        lines.append(f"🍽 Порция: <b>~{portion_weight} г</b>")
+        if portion_cal:
+            lines.append(f"🔥 <b>~{portion_cal} ккал</b>")
+            lines.append(f"🥩 Б: <b>~{p} г</b>  🧈 Ж: <b>~{f} г</b>  🍚 У: <b>~{c} г</b>")
         lines.append("")
-    lines.append("🛒 В список покупок всё равно добавляются общие ингредиенты.")
-    return "\n".join(lines)
+
+    lines.append("🛒 В список покупок добавляются общие ингредиенты рецепта.")
+    return "\n".join(lines).strip()
 
 
 def _has_word(text: str, words: list[str]) -> bool:
@@ -2286,6 +2548,25 @@ def home_keyboard() -> InlineKeyboardMarkup:
 
 
 
+PROFILE_TERM_GROUPS = {
+    "мясо": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон"],
+    "мясное": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон"],
+    "молочка": ["молоко", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир", "сливочное масло"],
+    "молочное": ["молоко", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир", "сливочное масло"],
+    "рыба": ["рыб", "тунец", "лосос", "семг", "форел", "кревет", "морепродукт"],
+    "рыбное": ["рыб", "тунец", "лосос", "семг", "форел", "кревет", "морепродукт"],
+    "морепродукты": ["кревет", "морепродукт", "рыб", "тунец", "лосос"],
+    "мучное": ["мука", "хлеб", "лаваш", "макарон", "паста", "спагетти", "лапша"],
+    "глютен": ["мука", "хлеб", "лаваш", "макарон", "паста", "спагетти", "лапша"],
+    "сладкое": ["сахар", "мед", "мёд", "шоколад", "варенье"],
+}
+
+
+def _expand_profile_term(term: str) -> list[str]:
+    normalized = term.lower().replace("ё", "е").strip()
+    return PROFILE_TERM_GROUPS.get(normalized, [normalized])
+
+
 def _split_profile_terms(value: str | None) -> list[str]:
     """Разбирает предпочтения/ограничения профиля: строки через запятую или JSON-список."""
     if not value:
@@ -2308,8 +2589,10 @@ def _split_profile_terms(value: str | None) -> list[str]:
             continue
         # Убираем совсем служебные слова, но не трогаем нормальные названия продуктов.
         term = term.replace("ё", "е")
-        if term not in result:
-            result.append(term)
+        expanded_terms = _expand_profile_term(term)
+        for expanded in expanded_terms:
+            if expanded not in result:
+                result.append(expanded)
     return result
 
 
@@ -2530,6 +2813,9 @@ async def send_home_screen(message: Message) -> None:
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    # Reply-клавиатура должна восстанавливаться всегда, даже если пользователь в обучении.
+    await message.answer("⌨️ Главное меню включено", reply_markup=main_keyboard())
+
     if not onboarding_completed(message.from_user.id):
         await message.answer(
             onboarding_intro_text(),
@@ -2538,16 +2824,34 @@ async def start(message: Message):
         )
         return
 
-    # Reply-клавиатуру нужно отправлять отдельным сообщением, потому что
-    # главный экран использует inline-кнопки. Отправляем её каждый раз на /start:
-    # так она восстановится даже после обновления, переустановки клиента или старых версий бота.
-    await message.answer("⌨️ Клавиатура включена", reply_markup=main_keyboard())
     await send_home_screen(message)
 
 
 
 @dp.callback_query(F.data == "onboarding:start")
 async def onboarding_start_callback(callback: CallbackQuery):
+    set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
+    await callback.message.edit_text(
+        onboarding_tour_text(1),
+        reply_markup=onboarding_tour_keyboard(1),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("onboarding:tour:"))
+async def onboarding_tour_callback(callback: CallbackQuery):
+    step = int(callback.data.split(":")[2])
+    await callback.message.edit_text(
+        onboarding_tour_text(step),
+        reply_markup=onboarding_tour_keyboard(step),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:create_profile")
+async def onboarding_create_profile_callback(callback: CallbackQuery):
     set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
     set_user_flag(callback.from_user.id, "awaiting_profile_name", "1")
     await callback.message.edit_text(
@@ -2574,9 +2878,39 @@ async def onboarding_add_profile_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "onboarding:skip_prefs")
+async def onboarding_skip_prefs_callback(callback: CallbackQuery):
+    profile_code = get_user_flag(callback.from_user.id, "awaiting_profile_preferences")
+    if profile_code:
+        delete_user_flag(callback.from_user.id, "awaiting_profile_preferences")
+        set_user_flag(callback.from_user.id, "awaiting_profile_restrictions", profile_code)
+        profile = get_profile(callback.from_user.id, profile_code)
+        await callback.message.answer(
+            onboarding_restrictions_prompt_text(profile["name"] if profile else "профиль"),
+            reply_markup=onboarding_skip_step_keyboard("onboarding:skip_limits"),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:skip_limits")
+async def onboarding_skip_limits_callback(callback: CallbackQuery):
+    profile_code = get_user_flag(callback.from_user.id, "awaiting_profile_restrictions")
+    if profile_code:
+        delete_user_flag(callback.from_user.id, "awaiting_profile_restrictions")
+    await callback.message.answer(
+        onboarding_add_more_text(),
+        reply_markup=onboarding_add_more_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "onboarding:notifications")
 async def onboarding_notifications_callback(callback: CallbackQuery):
     delete_user_flag(callback.from_user.id, "awaiting_profile_name")
+    delete_user_flag(callback.from_user.id, "awaiting_profile_preferences")
+    delete_user_flag(callback.from_user.id, "awaiting_profile_restrictions")
     await callback.message.edit_text(
         onboarding_notifications_text(),
         reply_markup=onboarding_notifications_keyboard(),
@@ -3539,6 +3873,32 @@ async def clear_callback(callback: CallbackQuery):
 
 @dp.message()
 async def fallback(message: Message):
+    if message.text and get_user_flag(message.from_user.id, "awaiting_profile_preferences"):
+        profile_code = get_user_flag(message.from_user.id, "awaiting_profile_preferences")
+        value = message.text.strip()
+        update_profile_field_db(message.from_user.id, profile_code, "preferences", value)
+        delete_user_flag(message.from_user.id, "awaiting_profile_preferences")
+        set_user_flag(message.from_user.id, "awaiting_profile_restrictions", profile_code)
+        profile = get_profile(message.from_user.id, profile_code)
+        await message.answer(
+            onboarding_restrictions_prompt_text(profile["name"] if profile else "профиль"),
+            reply_markup=onboarding_skip_step_keyboard("onboarding:skip_limits"),
+            parse_mode="HTML",
+        )
+        return
+
+    if message.text and get_user_flag(message.from_user.id, "awaiting_profile_restrictions"):
+        profile_code = get_user_flag(message.from_user.id, "awaiting_profile_restrictions")
+        value = message.text.strip()
+        update_profile_field_db(message.from_user.id, profile_code, "restrictions", value)
+        delete_user_flag(message.from_user.id, "awaiting_profile_restrictions")
+        await message.answer(
+            onboarding_add_more_text(),
+            reply_markup=onboarding_add_more_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
     if message.text and get_user_flag(message.from_user.id, "awaiting_profile_name") == "1":
         name = message.text.strip()
         if len(name) < 2:
@@ -3550,9 +3910,10 @@ async def fallback(message: Message):
         code = add_profile_db(message.from_user.id, name)
         delete_user_flag(message.from_user.id, "awaiting_profile_name")
         if get_user_flag(message.from_user.id, ONBOARDING_FLOW_KEY) == "1":
+            set_user_flag(message.from_user.id, "awaiting_profile_preferences", code)
             await message.answer(
-                onboarding_add_more_text(),
-                reply_markup=onboarding_add_more_keyboard(),
+                onboarding_preferences_prompt_text(name),
+                reply_markup=onboarding_skip_step_keyboard("onboarding:skip_prefs"),
                 parse_mode="HTML",
             )
             return
