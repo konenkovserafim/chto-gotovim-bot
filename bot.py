@@ -257,28 +257,28 @@ def init_db() -> None:
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 recipe_id INTEGER NOT NULL,
                 PRIMARY KEY (user_id, recipe_id)
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS shopping_items (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 item TEXT NOT NULL,
                 PRIMARY KEY (user_id, item)
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS fridge_items (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 product_code TEXT NOT NULL,
                 PRIMARY KEY (user_id, product_code)
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS household_profiles (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 profile_code TEXT NOT NULL,
                 name TEXT NOT NULL,
                 goal TEXT NOT NULL,
@@ -307,7 +307,7 @@ def init_db() -> None:
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_flags (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
                 PRIMARY KEY (user_id, key)
@@ -316,20 +316,35 @@ def init_db() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cooking_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 recipe_id INTEGER NOT NULL,
                 cooked_at TEXT NOT NULL
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS recipe_ratings (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 recipe_id INTEGER NOT NULL,
                 rating INTEGER NOT NULL,
                 rated_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, recipe_id)
             )
         """)
+        if USE_POSTGRES:
+            # Telegram user_id может быть больше 2_147_483_647.
+            # В PostgreSQL тип INTEGER 32-битный, поэтому для user_id нужен BIGINT.
+            # Миграция безопасна: если таблица уже создана с INTEGER, меняем тип колонки.
+            for table_name in (
+                "favorites",
+                "shopping_items",
+                "fridge_items",
+                "household_profiles",
+                "user_flags",
+                "cooking_history",
+                "recipe_ratings",
+            ):
+                conn.execute(f"ALTER TABLE {table_name} ALTER COLUMN user_id TYPE BIGINT")
+
         for recipe in recipes:
             conn.execute(
                 """
