@@ -4,11 +4,6 @@ import logging
 import os
 import random
 import sqlite3
-try:
-    import psycopg2
-    import psycopg2.extras
-except ImportError:
-    psycopg2 = None
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -35,8 +30,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Add it in Railway Variables.")
 
 RECIPES_PATH = Path("recipes.json")
-DATABASE_URL = os.getenv("DATABASE_URL")
-DB_PATH = Path(os.getenv("DB_PATH", "bot_data.db"))
+DB_PATH = Path("bot_data.db")
 PAGE_SIZE = 8
 
 CATEGORY_TITLES = {
@@ -143,122 +137,10 @@ def load_recipes_from_json() -> list[dict[str, Any]]:
         return json.load(f)
 
 
-USE_POSTGRES = bool(DATABASE_URL)
-
-
-def _pg_placeholders(sql: str) -> str:
-    """Convert SQLite-style placeholders to psycopg2 placeholders."""
-    return sql.replace("?", "%s")
-
-
-def _strip_sql(sql: str) -> str:
-    return " ".join(sql.strip().split())
-
-
-def _pg_transform_sql(sql: str) -> str:
-    """Small compatibility layer: keep the old SQLite-style code working on PostgreSQL."""
-    clean = _strip_sql(sql)
-    transformed = sql
-
-    # DDL compatibility
-    transformed = transformed.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
-    transformed = transformed.replace("user_id INTEGER", "user_id BIGINT")
-    transformed = transformed.replace("COLLATE NOCASE", "")
-
-    # SQLite UPSERT / IGNORE compatibility
-    if clean.startswith("INSERT OR REPLACE INTO recipes"):
-        transformed = transformed.replace("INSERT OR REPLACE INTO recipes", "INSERT INTO recipes")
-        transformed = transformed.rstrip().rstrip(";") + """
-        ON CONFLICT (id) DO UPDATE SET
-            category = EXCLUDED.category,
-            name = EXCLUDED.name,
-            time = EXCLUDED.time,
-            difficulty = EXCLUDED.difficulty,
-            price = EXCLUDED.price,
-            calories = EXCLUDED.calories,
-            ingredients_json = EXCLUDED.ingredients_json,
-            steps_json = EXCLUDED.steps_json,
-            tags_json = EXCLUDED.tags_json
-        """
-    elif clean.startswith("INSERT OR REPLACE INTO user_flags"):
-        transformed = transformed.replace("INSERT OR REPLACE INTO user_flags", "INSERT INTO user_flags")
-        transformed = transformed.rstrip().rstrip(";") + " ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value"
-    elif clean.startswith("INSERT OR REPLACE INTO recipe_ratings"):
-        transformed = transformed.replace("INSERT OR REPLACE INTO recipe_ratings", "INSERT INTO recipe_ratings")
-        transformed = transformed.rstrip().rstrip(";") + " ON CONFLICT (user_id, recipe_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = EXCLUDED.rated_at"
-    elif clean.startswith("INSERT OR IGNORE INTO"):
-        transformed = transformed.replace("INSERT OR IGNORE INTO", "INSERT INTO")
-        transformed = transformed.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
-
-    return _pg_placeholders(transformed)
-
-
-class PostgresConnection:
-    def __init__(self, url: str):
-        if psycopg2 is None:
-            raise RuntimeError("DATABASE_URL is set, but psycopg2-binary is not installed. Add psycopg2-binary to requirements.txt.")
-        self.conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if exc_type is None:
-            self.conn.commit()
-        else:
-            self.conn.rollback()
-        self.conn.close()
-
-    def execute(self, sql: str, params: tuple | list = ()):  # sqlite-compatible API
-        clean = _strip_sql(sql)
-        cur = self.conn.cursor()
-
-        # Emulate SQLite PRAGMA table_info(table) for the profile migration block.
-        if clean.upper().startswith("PRAGMA TABLE_INFO"):
-            table = clean[clean.find("(") + 1:clean.rfind(")")].strip().strip("'\"")
-            cur.execute(
-                """
-                SELECT column_name AS name
-                FROM information_schema.columns
-                WHERE table_schema = 'public' AND table_name = %s
-                ORDER BY ordinal_position
-                """,
-                (table,),
-            )
-            return cur
-
-        cur.execute(_pg_transform_sql(sql), tuple(params or ()))
-        return cur
-
-    def commit(self):
-        self.conn.commit()
-
-
-
-def db_connect():
-    if USE_POSTGRES:
-        return PostgresConnection(DATABASE_URL)
+def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def ensure_postgres_bigint_user_ids(conn) -> None:
-    if not USE_POSTGRES:
-        return
-    for table in [
-        "favorites",
-        "shopping_items",
-        "fridge_items",
-        "household_profiles",
-        "user_flags",
-        "cooking_history",
-        "recipe_ratings",
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE {table} ALTER COLUMN user_id TYPE BIGINT")
-        except Exception:
-            logger.exception("Could not migrate %s.user_id to BIGINT", table)
 
 
 def init_db() -> None:
@@ -353,7 +235,6 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, recipe_id)
             )
         """)
-        ensure_postgres_bigint_user_ids(conn)
         for recipe in recipes:
             conn.execute(
                 """
@@ -492,11 +373,17 @@ ONBOARDING_FLOW_KEY = "onboarding_flow_v1"
 def onboarding_intro_text() -> str:
     return (
         "🍽 <b>Добро пожаловать в «Что готовим?»</b>\n\n"
-        "Я помогу вам:\n\n"
-        "🥘 подобрать блюда\n"
-        "🛒 составить список покупок\n"
-        "📅 сделать меню недели\n"
-        "👨‍👩‍👧 учитывать вкусы всей семьи\n\n"
+        "Я помогу выбрать, что приготовить, и подстроюсь под вашу семью.\n\n"
+        "<b>Что здесь есть:</b>\n\n"
+        "🍳 <b>Завтрак / Обед / Ужин / Перекус</b> — разделы с рецептами.\n"
+        "✨ <b>Подобрать блюдо</b> — быстрый умный совет по времени дня.\n"
+        "📅 <b>Меню недели</b> — план блюд на 7 дней и продукты к нему.\n"
+        "🔍 <b>Поиск</b> — найти блюдо по названию или фильтрам.\n"
+        "🛒 <b>Список продуктов</b> — что нужно купить.\n"
+        "🥶 <b>Холодильник</b> — что уже есть дома.\n"
+        "👥 <b>Профили и семья</b> — вкусы, цели и ограничения каждого.\n"
+        "⚙️ <b>Настройки</b> — уведомления, история и обучение.\n\n"
+        "Сначала создадим профиль — так рекомендации сразу станут точнее.\n\n"
         "Начнём?"
     )
 
@@ -515,6 +402,39 @@ def onboarding_profile_prompt_text() -> str:
         "Введите имя профиля одним сообщением.\n\n"
         "Например: <b>Серафим</b> или <b>Таня</b>."
     )
+
+
+def onboarding_preferences_prompt_text(profile_name: str) -> str:
+    return (
+        f"❤️ <b>Предпочтения: {profile_name}</b>\n\n"
+        "Что нравится? Можно написать продукты, блюда или кухню.\n\n"
+        "Например: <b>курица, паста, сырники, итальянская кухня</b>."
+    )
+
+
+def onboarding_restrictions_prompt_text(profile_name: str) -> str:
+    return (
+        f"🚫 <b>Ограничения: {profile_name}</b>\n\n"
+        "Что не предлагать этому человеку?\n\n"
+        "Можно указать конкретные продукты или обобщения.\n"
+        "Например: <b>свинина, грибы, молочное, мясное, острое</b>."
+    )
+
+
+def onboarding_skip_pref_keyboard(profile_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустить", callback_data=f"onboarding:prefs_skip:{profile_code}")],
+    ])
+
+
+def onboarding_skip_restrictions_keyboard(profile_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустить", callback_data=f"onboarding:restrictions_skip:{profile_code}")],
+    ])
+
+
+def finish_onboarding_profile_text() -> str:
+    return onboarding_add_more_text()
 
 
 def onboarding_add_more_text() -> str:
@@ -575,6 +495,8 @@ def set_onboarding_completed(user_id: int) -> None:
     set_user_flag(user_id, ONBOARDING_DONE_KEY, "1")
     delete_user_flag(user_id, ONBOARDING_FLOW_KEY)
     delete_user_flag(user_id, "awaiting_profile_name")
+    delete_user_flag(user_id, "awaiting_onboarding_preferences")
+    delete_user_flag(user_id, "awaiting_onboarding_restrictions")
 
 NOTIFICATION_DEFAULT_TIMES = {
     "breakfast": "09:00",
@@ -2647,6 +2569,21 @@ async def send_home_screen(message: Message) -> None:
     )
 
 
+async def refresh_reply_keyboard(message: Message) -> None:
+    """Показывает постоянную нижнюю клавиатуру.
+
+    Telegram не позволяет прикрепить inline-кнопки и reply-клавиатуру
+    к одному сообщению одновременно, поэтому отправляем короткое служебное
+    сообщение и сразу удаляем его. Клавиатура при этом остаётся у пользователя.
+    """
+    try:
+        keyboard_message = await message.answer("⌨️ Меню включено", reply_markup=main_keyboard())
+        await asyncio.sleep(0.4)
+        await keyboard_message.delete()
+    except Exception:
+        logger.exception("Failed to refresh reply keyboard")
+
+
 @dp.message(CommandStart())
 async def start(message: Message):
     if not onboarding_completed(message.from_user.id):
@@ -2658,12 +2595,7 @@ async def start(message: Message):
         return
 
     await send_home_screen(message)
-
-    # Один раз отправляем Reply-клавиатуру, чтобы появилась кнопка «🏠 Главная».
-    # Дальше главный экран открывается без лишних сообщений.
-    if get_user_flag(message.from_user.id, "reply_keyboard_home_v1") != "1":
-        await message.answer("⌨️ Клавиатура обновлена", reply_markup=main_keyboard())
-        set_user_flag(message.from_user.id, "reply_keyboard_home_v1", "1")
+    await refresh_reply_keyboard(message)
 
 
 
@@ -2695,9 +2627,38 @@ async def onboarding_add_profile_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("onboarding:prefs_skip:"))
+async def onboarding_prefs_skip_callback(callback: CallbackQuery):
+    profile_code = callback.data.split(":", 2)[2]
+    profile = get_profile(callback.from_user.id, profile_code)
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    set_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions", profile_code)
+    profile_name = profile["name"] if profile else "профиль"
+    await callback.message.edit_text(
+        onboarding_restrictions_prompt_text(profile_name),
+        reply_markup=onboarding_skip_restrictions_keyboard(profile_code),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("onboarding:restrictions_skip:"))
+async def onboarding_restrictions_skip_callback(callback: CallbackQuery):
+    profile_code = callback.data.split(":", 2)[2]
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
+    await callback.message.edit_text(
+        finish_onboarding_profile_text(),
+        reply_markup=onboarding_add_more_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "onboarding:notifications")
 async def onboarding_notifications_callback(callback: CallbackQuery):
     delete_user_flag(callback.from_user.id, "awaiting_profile_name")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
     await callback.message.edit_text(
         onboarding_notifications_text(),
         reply_markup=onboarding_notifications_keyboard(),
@@ -2730,19 +2691,17 @@ async def onboarding_finish_callback(callback: CallbackQuery):
 @dp.callback_query(F.data == "onboarding:skip")
 async def onboarding_skip_callback(callback: CallbackQuery):
     set_onboarding_completed(callback.from_user.id)
-    await callback.message.answer(
-        "Готово. Можно вернуться к знакомству позже в настройках.",
-        reply_markup=main_keyboard(),
-    )
+    await callback.message.answer("Готово. Можно вернуться к знакомству позже в настройках.")
     await send_home_screen(callback.message)
+    await refresh_reply_keyboard(callback.message)
     await callback.answer()
 
 
 @dp.callback_query(F.data == "onboarding:open_home")
 async def onboarding_open_home_callback(callback: CallbackQuery):
     set_onboarding_completed(callback.from_user.id)
-    await callback.message.answer("⌨️ Главное меню включено", reply_markup=main_keyboard())
     await send_home_screen(callback.message)
+    await refresh_reply_keyboard(callback.message)
     await callback.answer()
 
 
@@ -3671,9 +3630,10 @@ async def fallback(message: Message):
         code = add_profile_db(message.from_user.id, name)
         delete_user_flag(message.from_user.id, "awaiting_profile_name")
         if get_user_flag(message.from_user.id, ONBOARDING_FLOW_KEY) == "1":
+            set_user_flag(message.from_user.id, "awaiting_onboarding_preferences", code)
             await message.answer(
-                onboarding_add_more_text(),
-                reply_markup=onboarding_add_more_keyboard(),
+                onboarding_preferences_prompt_text(name),
+                reply_markup=onboarding_skip_pref_keyboard(code),
                 parse_mode="HTML",
             )
             return
@@ -3681,6 +3641,35 @@ async def fallback(message: Message):
         await message.answer(
             profile_detail_text(profile),
             reply_markup=profile_detail_keyboard(code),
+            parse_mode="HTML",
+        )
+        return
+
+    pref_profile_code = get_user_flag(message.from_user.id, "awaiting_onboarding_preferences")
+    if message.text and pref_profile_code:
+        text = message.text.strip()
+        profile = get_profile(message.from_user.id, pref_profile_code)
+        if profile and text.lower() not in {"пропустить", "нет", "-"}:
+            update_profile_field_db(message.from_user.id, pref_profile_code, "preferences", text)
+        delete_user_flag(message.from_user.id, "awaiting_onboarding_preferences")
+        set_user_flag(message.from_user.id, "awaiting_onboarding_restrictions", pref_profile_code)
+        profile_name = profile["name"] if profile else "профиль"
+        await message.answer(
+            onboarding_restrictions_prompt_text(profile_name),
+            reply_markup=onboarding_skip_restrictions_keyboard(pref_profile_code),
+            parse_mode="HTML",
+        )
+        return
+
+    limits_profile_code = get_user_flag(message.from_user.id, "awaiting_onboarding_restrictions")
+    if message.text and limits_profile_code:
+        text = message.text.strip()
+        if text.lower() not in {"пропустить", "нет", "-"}:
+            update_profile_field_db(message.from_user.id, limits_profile_code, "restrictions", text)
+        delete_user_flag(message.from_user.id, "awaiting_onboarding_restrictions")
+        await message.answer(
+            finish_onboarding_profile_text(),
+            reply_markup=onboarding_add_more_keyboard(),
             parse_mode="HTML",
         )
         return
