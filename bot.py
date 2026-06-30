@@ -4,8 +4,11 @@ import logging
 import os
 import random
 import sqlite3
-import subprocess
-import sys
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -32,9 +35,8 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Add it in Railway Variables.")
 
 RECIPES_PATH = Path("recipes.json")
-DB_PATH = Path(os.getenv("DB_PATH", "bot_data.db"))
 DATABASE_URL = os.getenv("DATABASE_URL")
-USE_POSTGRES = bool(DATABASE_URL)
+DB_PATH = Path(os.getenv("DB_PATH", "bot_data.db"))
 PAGE_SIZE = 8
 
 CATEGORY_TITLES = {
@@ -141,101 +143,122 @@ def load_recipes_from_json() -> list[dict[str, Any]]:
         return json.load(f)
 
 
-def _ensure_psycopg2():
-    try:
-        import psycopg2  # type: ignore
-        from psycopg2.extras import RealDictCursor  # type: ignore
-        return psycopg2, RealDictCursor
-    except ImportError:
-        logger.warning("psycopg2-binary is not installed. Installing at runtime...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "psycopg2-binary"])
-        import psycopg2  # type: ignore
-        from psycopg2.extras import RealDictCursor  # type: ignore
-        return psycopg2, RealDictCursor
+USE_POSTGRES = bool(DATABASE_URL)
 
 
-class _PgCursorResult:
-    def __init__(self, cursor):
-        self.cursor = cursor
-        self.rowcount = cursor.rowcount
-
-    def fetchone(self):
-        return self.cursor.fetchone()
-
-    def fetchall(self):
-        return self.cursor.fetchall()
+def _pg_placeholders(sql: str) -> str:
+    """Convert SQLite-style placeholders to psycopg2 placeholders."""
+    return sql.replace("?", "%s")
 
 
-class _PgConnection:
-    def __init__(self):
-        psycopg2, RealDictCursor = _ensure_psycopg2()
-        self._conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+def _strip_sql(sql: str) -> str:
+    return " ".join(sql.strip().split())
+
+
+def _pg_transform_sql(sql: str) -> str:
+    """Small compatibility layer: keep the old SQLite-style code working on PostgreSQL."""
+    clean = _strip_sql(sql)
+    transformed = sql
+
+    # DDL compatibility
+    transformed = transformed.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+    transformed = transformed.replace("user_id INTEGER", "user_id BIGINT")
+    transformed = transformed.replace("COLLATE NOCASE", "")
+
+    # SQLite UPSERT / IGNORE compatibility
+    if clean.startswith("INSERT OR REPLACE INTO recipes"):
+        transformed = transformed.replace("INSERT OR REPLACE INTO recipes", "INSERT INTO recipes")
+        transformed = transformed.rstrip().rstrip(";") + """
+        ON CONFLICT (id) DO UPDATE SET
+            category = EXCLUDED.category,
+            name = EXCLUDED.name,
+            time = EXCLUDED.time,
+            difficulty = EXCLUDED.difficulty,
+            price = EXCLUDED.price,
+            calories = EXCLUDED.calories,
+            ingredients_json = EXCLUDED.ingredients_json,
+            steps_json = EXCLUDED.steps_json,
+            tags_json = EXCLUDED.tags_json
+        """
+    elif clean.startswith("INSERT OR REPLACE INTO user_flags"):
+        transformed = transformed.replace("INSERT OR REPLACE INTO user_flags", "INSERT INTO user_flags")
+        transformed = transformed.rstrip().rstrip(";") + " ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value"
+    elif clean.startswith("INSERT OR REPLACE INTO recipe_ratings"):
+        transformed = transformed.replace("INSERT OR REPLACE INTO recipe_ratings", "INSERT INTO recipe_ratings")
+        transformed = transformed.rstrip().rstrip(";") + " ON CONFLICT (user_id, recipe_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = EXCLUDED.rated_at"
+    elif clean.startswith("INSERT OR IGNORE INTO"):
+        transformed = transformed.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        transformed = transformed.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+
+    return _pg_placeholders(transformed)
+
+
+class PostgresConnection:
+    def __init__(self, url: str):
+        if psycopg2 is None:
+            raise RuntimeError("DATABASE_URL is set, but psycopg2-binary is not installed. Add psycopg2-binary to requirements.txt.")
+        self.conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if exc_type:
-            self._conn.rollback()
+        if exc_type is None:
+            self.conn.commit()
         else:
-            self._conn.commit()
-        self._conn.close()
+            self.conn.rollback()
+        self.conn.close()
 
-    def commit(self) -> None:
-        self._conn.commit()
+    def execute(self, sql: str, params: tuple | list = ()):  # sqlite-compatible API
+        clean = _strip_sql(sql)
+        cur = self.conn.cursor()
 
-    def execute(self, query: str, params: tuple = ()):  # sqlite-compatible wrapper
-        sql = self._translate_sql(query)
-        cur = self._conn.cursor()
-        cur.execute(sql, params)
-        return _PgCursorResult(cur)
+        # Emulate SQLite PRAGMA table_info(table) for the profile migration block.
+        if clean.upper().startswith("PRAGMA TABLE_INFO"):
+            table = clean[clean.find("(") + 1:clean.rfind(")")].strip().strip("'\"")
+            cur.execute(
+                """
+                SELECT column_name AS name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            return cur
 
-    def _translate_sql(self, query: str) -> str:
-        q = query.strip()
-        lower = " ".join(q.lower().split())
+        cur.execute(_pg_transform_sql(sql), tuple(params or ()))
+        return cur
 
-        if lower == "pragma table_info(household_profiles)":
-            return "SELECT column_name AS name FROM information_schema.columns WHERE table_name = 'household_profiles'"
+    def commit(self):
+        self.conn.commit()
 
-        q = q.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
-        q = q.replace("COLLATE NOCASE", "")
-
-        if "insert or ignore into" in lower:
-            q = q.replace("INSERT OR IGNORE INTO", "INSERT INTO")
-            q = q.replace("insert or ignore into", "insert into")
-            q += " ON CONFLICT DO NOTHING"
-
-        if "insert or replace into recipes" in lower:
-            q = q.replace("INSERT OR REPLACE INTO", "INSERT INTO")
-            q += """
-                ON CONFLICT (id) DO UPDATE SET
-                    category = EXCLUDED.category,
-                    name = EXCLUDED.name,
-                    time = EXCLUDED.time,
-                    difficulty = EXCLUDED.difficulty,
-                    price = EXCLUDED.price,
-                    calories = EXCLUDED.calories,
-                    ingredients_json = EXCLUDED.ingredients_json,
-                    steps_json = EXCLUDED.steps_json,
-                    tags_json = EXCLUDED.tags_json
-            """
-        elif "insert or replace into user_flags" in lower:
-            q = q.replace("INSERT OR REPLACE INTO", "INSERT INTO")
-            q += " ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value"
-        elif "insert or replace into recipe_ratings" in lower:
-            q = q.replace("INSERT OR REPLACE INTO", "INSERT INTO")
-            q += " ON CONFLICT (user_id, recipe_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = EXCLUDED.rated_at"
-
-        q = q.replace("?", "%s")
-        return q
 
 
 def db_connect():
     if USE_POSTGRES:
-        return _PgConnection()
+        return PostgresConnection(DATABASE_URL)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_postgres_bigint_user_ids(conn) -> None:
+    if not USE_POSTGRES:
+        return
+    for table in [
+        "favorites",
+        "shopping_items",
+        "fridge_items",
+        "household_profiles",
+        "user_flags",
+        "cooking_history",
+        "recipe_ratings",
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE {table} ALTER COLUMN user_id TYPE BIGINT")
+        except Exception:
+            logger.exception("Could not migrate %s.user_id to BIGINT", table)
 
 
 def init_db() -> None:
@@ -257,28 +280,28 @@ def init_db() -> None:
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL,
                 recipe_id INTEGER NOT NULL,
                 PRIMARY KEY (user_id, recipe_id)
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS shopping_items (
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL,
                 item TEXT NOT NULL,
                 PRIMARY KEY (user_id, item)
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS fridge_items (
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL,
                 product_code TEXT NOT NULL,
                 PRIMARY KEY (user_id, product_code)
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS household_profiles (
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL,
                 profile_code TEXT NOT NULL,
                 name TEXT NOT NULL,
                 goal TEXT NOT NULL,
@@ -307,7 +330,7 @@ def init_db() -> None:
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_flags (
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL,
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
                 PRIMARY KEY (user_id, key)
@@ -316,35 +339,21 @@ def init_db() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cooking_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL,
                 recipe_id INTEGER NOT NULL,
                 cooked_at TEXT NOT NULL
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS recipe_ratings (
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL,
                 recipe_id INTEGER NOT NULL,
                 rating INTEGER NOT NULL,
                 rated_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, recipe_id)
             )
         """)
-        if USE_POSTGRES:
-            # Telegram user_id может быть больше 2_147_483_647.
-            # В PostgreSQL тип INTEGER 32-битный, поэтому для user_id нужен BIGINT.
-            # Миграция безопасна: если таблица уже создана с INTEGER, меняем тип колонки.
-            for table_name in (
-                "favorites",
-                "shopping_items",
-                "fridge_items",
-                "household_profiles",
-                "user_flags",
-                "cooking_history",
-                "recipe_ratings",
-            ):
-                conn.execute(f"ALTER TABLE {table_name} ALTER COLUMN user_id TYPE BIGINT")
-
+        ensure_postgres_bigint_user_ids(conn)
         for recipe in recipes:
             conn.execute(
                 """
