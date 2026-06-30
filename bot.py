@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -370,15 +371,21 @@ ONBOARDING_DONE_KEY = "onboarding_done_v1"
 ONBOARDING_FLOW_KEY = "onboarding_flow_v1"
 
 
+
 def onboarding_intro_text() -> str:
     return (
         "🍽 <b>Добро пожаловать в «Что готовим?»</b>\n\n"
-        "Я помогу вам:\n\n"
-        "🥘 подобрать блюда\n"
-        "🛒 составить список покупок\n"
-        "📅 сделать меню недели\n"
-        "👨‍👩‍👧 учитывать вкусы всей семьи\n\n"
-        "Начнём?"
+        "Это домашний помощник для еды на каждый день.\n\n"
+        "<b>Что здесь есть:</b>\n\n"
+        "🏠 <b>Главная</b> — быстрый старт: подбор блюда и нужный приём пищи.\n\n"
+        "🍳 <b>Завтрак / Обед / Ужин / Перекус</b> — готовые разделы с рецептами.\n\n"
+        "📅 <b>Меню недели</b> — бот составляет план на 7 дней, даёт заменить одно блюдо и добавить продукты в покупки.\n\n"
+        "🔍 <b>Поиск</b> — можно найти блюдо по названию или ингредиенту и использовать фильтры.\n\n"
+        "🛒 <b>Список продуктов</b> — сюда попадают продукты из рецептов и меню недели.\n\n"
+        "🥶 <b>Холодильник</b> — отметьте, что есть дома, чтобы рекомендации были точнее.\n\n"
+        "👥 <b>Профили и семья</b> — вкусы, ограничения, цели и калории каждого участника.\n\n"
+        "⚙️ <b>Настройки</b> — уведомления, история, обучение и информация о боте.\n\n"
+        "Начнём с первого профиля?"
     )
 
 
@@ -391,16 +398,40 @@ def onboarding_intro_keyboard() -> InlineKeyboardMarkup:
 
 def onboarding_profile_prompt_text() -> str:
     return (
-        "👤 <b>Давайте создадим первый профиль.</b>\n\n"
-        "Так бот сможет учитывать предпочтения, ограничения и цели каждого.\n\n"
-        "Введите имя профиля одним сообщением.\n\n"
+        "👤 <b>Создадим первый профиль</b>\n\n"
+        "Напишите имя человека, для кого бот будет подбирать блюда.\n\n"
         "Например: <b>Серафим</b> или <b>Таня</b>."
     )
+
+
+def onboarding_preferences_prompt_text(profile_name: str) -> str:
+    return (
+        f"❤️ <b>Предпочтения: {profile_name}</b>\n\n"
+        "Что любит этот человек?\n\n"
+        "Можно написать продукты, блюда или кухни через запятую.\n\n"
+        "Например: <b>курица, паста, сырники, итальянская кухня</b>."
+    )
+
+
+def onboarding_restrictions_prompt_text(profile_name: str) -> str:
+    return (
+        f"🚫 <b>Ограничения: {profile_name}</b>\n\n"
+        "Что не нужно предлагать?\n\n"
+        "Можно написать продукты или группы продуктов через запятую.\n\n"
+        "Например: <b>свинина, грибы, морепродукты, молочное</b>."
+    )
+
+
+def onboarding_skip_step_keyboard(kind: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустить", callback_data=f"onboarding:skip_{kind}")],
+    ])
 
 
 def onboarding_add_more_text() -> str:
     return (
         "✅ <b>Профиль создан.</b>\n\n"
+        "Теперь бот уже может учитывать предпочтения и ограничения.\n\n"
         "Хотите добавить ещё одного участника семьи?"
     )
 
@@ -437,7 +468,7 @@ def onboarding_finish_text(user_id: int) -> str:
         f"{profiles_line}\n"
         f"{notify_line}\n\n"
         "💡 Чем больше информации вы заполните в профилях и холодильнике,\n"
-        "тем точнее будут мои рекомендации."
+        "тем точнее будут рекомендации, меню недели и список покупок."
     )
 
 
@@ -454,8 +485,15 @@ def onboarding_completed(user_id: int) -> bool:
 
 def set_onboarding_completed(user_id: int) -> None:
     set_user_flag(user_id, ONBOARDING_DONE_KEY, "1")
-    delete_user_flag(user_id, ONBOARDING_FLOW_KEY)
-    delete_user_flag(user_id, "awaiting_profile_name")
+    for key in (
+        ONBOARDING_FLOW_KEY,
+        "awaiting_profile_name",
+        "awaiting_profile_preferences",
+        "awaiting_profile_restrictions",
+        "onboarding_last_profile_code",
+    ):
+        delete_user_flag(user_id, key)
+
 
 NOTIFICATION_DEFAULT_TIMES = {
     "breakfast": "09:00",
@@ -1993,53 +2031,41 @@ def add_weekly_menu_to_shopping(user_id: int) -> int:
     return added
 
 
-def estimate_recipe_weight(recipe: dict[str, Any]) -> int:
-    """Очень примерная оценка веса готового блюда по ингредиентам.
+def _parse_ingredient_amount(item: str) -> float:
+    """Возвращает примерный вес ингредиента в граммах для оценки общего веса блюда."""
+    if "—" not in item:
+        return 0.0
+    amount = item.split("—", 1)[1].strip().lower().replace(",", ".")
+    match = re.search(r"(\d+(?:\.\d+)?)", amount)
+    if not match:
+        return 0.0
+    value = float(match.group(1))
+    if "кг" in amount:
+        return value * 1000
+    if "мл" in amount:
+        return value
+    if "л" in amount and "ст. л" not in amount and "ч. л" not in amount:
+        return value * 1000
+    if "шт" in amount:
+        return value * 80
+    if "ст. л" in amount:
+        return value * 15
+    if "ч. л" in amount:
+        return value * 5
+    if "г" in amount:
+        return value
+    return 0.0
 
-    В базе ингредиенты хранятся строками, поэтому это не точная нутрициология,
-    а удобная бытовая оценка для распределения готового блюда по тарелкам.
-    """
-    import re
 
-    total = 0.0
-    for item in recipe.get("ingredients", []):
-        text = str(item).lower().replace(",", ".")
-        match = re.search(r"(\d+(?:\.\d+)?)", text)
-        if not match:
-            continue
-        value = float(match.group(1))
-
-        if "кг" in text:
-            total += value * 1000
-        elif "л" in text and "мл" not in text and "ст. л" not in text and "ч. л" not in text:
-            total += value * 1000
-        elif "мл" in text or "г" in text:
-            total += value
-        elif "шт" in text or "яйц" in text:
-            name = text.split("—", 1)[0] if "—" in text else text
-            if "яй" in name:
-                total += value * 55
-            elif "лук" in name or "помид" in name or "огур" in name or "яблок" in name:
-                total += value * 100
-            else:
-                total += value * 80
-        elif "ст. л" in text:
-            total += value * 18
-        elif "ч. л" in text:
-            total += value * 5
-
+def _recipe_total_weight(recipe: dict[str, Any]) -> int:
+    total = sum(_parse_ingredient_amount(str(item)) for item in recipe.get("ingredients", []))
     if total <= 0:
-        # запасной вариант: средний вес блюда на двоих
         return 700
     return int(round(total / 10) * 10)
 
 
-def estimate_macros(calories: int) -> tuple[int, int, int]:
-    """Примерное КБЖУ по калорийности блюда.
-
-    В recipes.json сейчас есть калории, но нет точных белков/жиров/углеводов,
-    поэтому считаем приблизительно: 25% белки, 30% жиры, 45% углеводы.
-    """
+def _macro_estimate(calories: int) -> tuple[int, int, int]:
+    """Грубая оценка БЖУ по калориям: белки 25%, жиры 30%, углеводы 45%."""
     if calories <= 0:
         return 0, 0, 0
     protein = round((calories * 0.25) / 4)
@@ -2048,12 +2074,20 @@ def estimate_macros(calories: int) -> tuple[int, int, int]:
     return int(protein), int(fat), int(carbs)
 
 
-def format_portions(recipe: dict[str, Any], user_id: int) -> str:
-    try:
-        profiles = family_active_profiles(user_id) or get_profiles(user_id)
-    except Exception:
-        profiles = get_profiles(user_id)
+def _profile_calorie_weight(profile: dict[str, Any]) -> int:
+    calories = int(profile.get("calories") or 0)
+    if calories > 0:
+        return calories
+    goal = str(profile.get("goal") or "").lower()
+    if "похуд" in goal:
+        return 1800
+    if "набор" in goal:
+        return 2800
+    return 2200
 
+
+def format_portions(recipe: dict[str, Any], user_id: int) -> str:
+    profiles = family_active_profiles(user_id) or get_profiles(user_id)
     if not profiles:
         return (
             "👥 <b>Порции</b>\n\n"
@@ -2062,21 +2096,11 @@ def format_portions(recipe: dict[str, Any], user_id: int) -> str:
         )
 
     total_cal = int(recipe.get("calories", 0) or 0)
-    total_weight = estimate_recipe_weight(recipe)
-    total_p, total_f, total_c = estimate_macros(total_cal)
+    total_weight = _recipe_total_weight(recipe)
+    total_protein, total_fat, total_carbs = _macro_estimate(total_cal)
 
-    calorie_norms: list[tuple[dict[str, Any], int]] = []
-    for profile in profiles:
-        norm = int(profile.get("calories") or 0)
-        calorie_norms.append((profile, norm if norm > 0 else 0))
-
-    norms_sum = sum(norm for _, norm in calorie_norms)
-    if norms_sum <= 0:
-        shares = [(profile, 1 / max(len(profiles), 1)) for profile in profiles]
-        share_note = "Если заполнить нормы калорий в профилях, доли будут считаться точнее."
-    else:
-        shares = [(profile, norm / norms_sum) for profile, norm in calorie_norms]
-        share_note = "Доли рассчитаны по нормам калорий в профилях."
+    weights = [_profile_calorie_weight(profile) for profile in profiles]
+    weights_sum = sum(weights) or len(profiles)
 
     lines = [
         f"👥 <b>Порции: {recipe['name']}</b>",
@@ -2086,36 +2110,28 @@ def format_portions(recipe: dict[str, Any], user_id: int) -> str:
 
     if total_cal:
         lines.extend([
+            "КБЖУ всего блюда:",
+            f"🔥 <b>{total_cal} ккал</b>",
+            f"🥩 Б: <b>{total_protein} г</b> · 🧈 Ж: <b>{total_fat} г</b> · 🍚 У: <b>{total_carbs} г</b>",
             "",
-            "<b>КБЖУ всего блюда:</b>",
-            f"🔥 <b>{total_cal}</b> ккал",
-            f"🥩 Б: <b>{total_p} г</b>",
-            f"🧈 Ж: <b>{total_f} г</b>",
-            f"🍚 У: <b>{total_c} г</b>",
         ])
 
-    lines.extend(["", "──────────────", ""])
-
-    for profile, share in shares:
+    for profile, weight in zip(profiles, weights):
+        share = weight / weights_sum if weights_sum else 1 / len(profiles)
         percent = int(round(share * 100))
         portion_weight = int(round(total_weight * share / 10) * 10)
-        kcal = int(round(total_cal * share)) if total_cal else 0
-        p = int(round(total_p * share))
-        f = int(round(total_f * share))
-        c = int(round(total_c * share))
+        portion_cal = int(round(total_cal * share)) if total_cal else 0
+        p, f, c = _macro_estimate(portion_cal)
 
-        lines.append(f"👤 <b>{profile['name']}</b>")
-        lines.append(f"Доля: <b>{percent}%</b>")
+        lines.append(f"👤 <b>{profile['name']}</b> — <b>{percent}%</b>")
         lines.append(f"🍽 Порция: <b>~{portion_weight} г</b>")
-        if kcal:
-            lines.append(f"🔥 <b>~{kcal} ккал</b>")
+        if portion_cal:
+            lines.append(f"🔥 <b>~{portion_cal} ккал</b>")
             lines.append(f"🥩 Б: <b>{p} г</b> · 🧈 Ж: <b>{f} г</b> · 🍚 У: <b>{c} г</b>")
         lines.append("")
 
-    lines.append(f"💡 {share_note}")
-    lines.append("🛒 В список покупок добавляются общие ингредиенты рецепта.")
-    return "\n".join(lines).strip()
-
+    lines.append("🛒 В список покупок всё равно добавляются общие ингредиенты.")
+    return "\n".join(lines)
 
 def _has_word(text: str, words: list[str]) -> bool:
     text_low = text.lower()
@@ -2640,9 +2656,12 @@ async def start(message: Message):
         return
 
     await send_home_screen(message)
-    # Telegram не позволяет прикрепить inline-кнопки и нижнюю клавиатуру к одному сообщению.
-    # Поэтому после /start всегда мягко обновляем Reply-клавиатуру отдельным коротким сообщением.
-    await message.answer("⌨️ Главное меню", reply_markup=main_keyboard())
+
+    # Один раз отправляем Reply-клавиатуру, чтобы появилась кнопка «🏠 Главная».
+    # Дальше главный экран открывается без лишних сообщений.
+    if get_user_flag(message.from_user.id, "reply_keyboard_home_v2") != "1":
+        await message.answer("⌨️ Клавиатура обновлена", reply_markup=main_keyboard())
+        set_user_flag(message.from_user.id, "reply_keyboard_home_v2", "1")
 
 
 
@@ -2674,9 +2693,38 @@ async def onboarding_add_profile_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+
+
+@dp.callback_query(F.data == "onboarding:skip_prefs")
+async def onboarding_skip_prefs_callback(callback: CallbackQuery):
+    profile_code = get_user_flag(callback.from_user.id, "awaiting_profile_preferences")
+    if profile_code:
+        profile = get_profile(callback.from_user.id, profile_code)
+        delete_user_flag(callback.from_user.id, "awaiting_profile_preferences")
+        set_user_flag(callback.from_user.id, "awaiting_profile_restrictions", profile_code)
+        await callback.message.edit_text(
+            onboarding_restrictions_prompt_text(profile["name"] if profile else "профиль"),
+            reply_markup=onboarding_skip_step_keyboard("restrictions"),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:skip_restrictions")
+async def onboarding_skip_restrictions_callback(callback: CallbackQuery):
+    delete_user_flag(callback.from_user.id, "awaiting_profile_restrictions")
+    delete_user_flag(callback.from_user.id, "onboarding_last_profile_code")
+    await callback.message.edit_text(
+        onboarding_add_more_text(),
+        reply_markup=onboarding_add_more_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
 @dp.callback_query(F.data == "onboarding:notifications")
 async def onboarding_notifications_callback(callback: CallbackQuery):
-    delete_user_flag(callback.from_user.id, "awaiting_profile_name")
+    for key in ("awaiting_profile_name", "awaiting_profile_preferences", "awaiting_profile_restrictions", "onboarding_last_profile_code"):
+        delete_user_flag(callback.from_user.id, key)
     await callback.message.edit_text(
         onboarding_notifications_text(),
         reply_markup=onboarding_notifications_keyboard(),
@@ -3649,17 +3697,48 @@ async def fallback(message: Message):
             return
         code = add_profile_db(message.from_user.id, name)
         delete_user_flag(message.from_user.id, "awaiting_profile_name")
+        profile = get_profile(message.from_user.id, code)
         if get_user_flag(message.from_user.id, ONBOARDING_FLOW_KEY) == "1":
+            set_user_flag(message.from_user.id, "onboarding_last_profile_code", code)
+            set_user_flag(message.from_user.id, "awaiting_profile_preferences", code)
             await message.answer(
-                onboarding_add_more_text(),
-                reply_markup=onboarding_add_more_keyboard(),
+                onboarding_preferences_prompt_text(profile["name"] if profile else name),
+                reply_markup=onboarding_skip_step_keyboard("prefs"),
                 parse_mode="HTML",
             )
             return
-        profile = get_profile(message.from_user.id, code)
         await message.answer(
             profile_detail_text(profile),
             reply_markup=profile_detail_keyboard(code),
+            parse_mode="HTML",
+        )
+        return
+
+    if message.text and get_user_flag(message.from_user.id, "awaiting_profile_preferences"):
+        profile_code = get_user_flag(message.from_user.id, "awaiting_profile_preferences")
+        value = message.text.strip()
+        profile = get_profile(message.from_user.id, profile_code)
+        if value:
+            update_profile_field_db(message.from_user.id, profile_code, "preferences", value)
+        delete_user_flag(message.from_user.id, "awaiting_profile_preferences")
+        set_user_flag(message.from_user.id, "awaiting_profile_restrictions", profile_code)
+        await message.answer(
+            onboarding_restrictions_prompt_text(profile["name"] if profile else "профиль"),
+            reply_markup=onboarding_skip_step_keyboard("restrictions"),
+            parse_mode="HTML",
+        )
+        return
+
+    if message.text and get_user_flag(message.from_user.id, "awaiting_profile_restrictions"):
+        profile_code = get_user_flag(message.from_user.id, "awaiting_profile_restrictions")
+        value = message.text.strip()
+        if value:
+            update_profile_field_db(message.from_user.id, profile_code, "restrictions", value)
+        delete_user_flag(message.from_user.id, "awaiting_profile_restrictions")
+        delete_user_flag(message.from_user.id, "onboarding_last_profile_code")
+        await message.answer(
+            onboarding_add_more_text(),
+            reply_markup=onboarding_add_more_keyboard(),
             parse_mode="HTML",
         )
         return
