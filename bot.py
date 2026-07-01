@@ -31,6 +31,7 @@ if not BOT_TOKEN:
 
 RECIPES_PATH = Path("recipes.json")
 DB_PATH = Path("bot_data.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 PAGE_SIZE = 8
 
 CATEGORY_TITLES = {
@@ -137,7 +138,92 @@ def load_recipes_from_json() -> list[dict[str, Any]]:
         return json.load(f)
 
 
-def db_connect() -> sqlite3.Connection:
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:
+    psycopg2 = None
+
+
+def _sqlite_to_pg_sql(sql: str) -> str:
+    """Минимальный перевод SQL из SQLite-стиля в PostgreSQL-стиль."""
+    text = sql
+    stripped = " ".join(text.strip().split()).lower()
+
+    text = text.replace("id INTEGER PRIMARY KEY AUTOINCREMENT", "id SERIAL PRIMARY KEY")
+    text = text.replace("user_id INTEGER NOT NULL", "user_id BIGINT NOT NULL")
+    text = text.replace("user_id INTEGER", "user_id BIGINT")
+    text = text.replace("REAL", "DOUBLE PRECISION")
+
+    # SQLite UPSERT/IGNORE -> PostgreSQL ON CONFLICT.
+    if stripped.startswith("insert or ignore into favorites"):
+        text = text.replace("INSERT OR IGNORE INTO favorites", "INSERT INTO favorites")
+        text += " ON CONFLICT (user_id, recipe_id) DO NOTHING"
+    elif stripped.startswith("insert or ignore into shopping_items"):
+        text = text.replace("INSERT OR IGNORE INTO shopping_items", "INSERT INTO shopping_items")
+        text += " ON CONFLICT (user_id, item) DO NOTHING"
+    elif stripped.startswith("insert or ignore into fridge_items"):
+        text = text.replace("INSERT OR IGNORE INTO fridge_items", "INSERT INTO fridge_items")
+        text += " ON CONFLICT (user_id, product_code) DO NOTHING"
+    elif stripped.startswith("insert or replace into user_flags"):
+        text = text.replace("INSERT OR REPLACE INTO user_flags", "INSERT INTO user_flags")
+        text += " ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value"
+    elif stripped.startswith("insert or replace into recipe_ratings"):
+        text = text.replace("INSERT OR REPLACE INTO recipe_ratings", "INSERT INTO recipe_ratings")
+        text += " ON CONFLICT (user_id, recipe_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = EXCLUDED.rated_at"
+    elif stripped.startswith("insert or replace into recipes"):
+        text = text.replace("INSERT OR REPLACE INTO recipes", "INSERT INTO recipes")
+        text += " ON CONFLICT (id) DO UPDATE SET category = EXCLUDED.category, name = EXCLUDED.name, time = EXCLUDED.time, difficulty = EXCLUDED.difficulty, price = EXCLUDED.price, calories = EXCLUDED.calories, ingredients_json = EXCLUDED.ingredients_json, steps_json = EXCLUDED.steps_json, tags_json = EXCLUDED.tags_json"
+
+    text = text.replace("?", "%s")
+    return text
+
+
+class PostgresConnection:
+    def __init__(self, dsn: str):
+        if psycopg2 is None:
+            raise RuntimeError("DATABASE_URL is set, but psycopg2-binary is not installed. Add psycopg2-binary to requirements.txt.")
+        self.conn = psycopg2.connect(dsn, cursor_factory=psycopg2.extras.RealDictCursor)
+
+    def execute(self, sql: str, params: tuple | list = ()):  # совместимость с sqlite3.Connection.execute
+        normalized = " ".join(sql.strip().split()).lower()
+        if normalized.startswith("pragma table_info"):
+            table = sql.split("(", 1)[1].split(")", 1)[0].strip()
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT column_name AS name
+                FROM information_schema.columns
+                WHERE table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            return cur
+        cur = self.conn.cursor()
+        cur.execute(_sqlite_to_pg_sql(sql), tuple(params or ()))
+        return cur
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.conn.commit()
+        else:
+            self.conn.rollback()
+        self.conn.close()
+
+
+def db_connect():
+    if DATABASE_URL:
+        return PostgresConnection(DATABASE_URL)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -235,6 +321,13 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, recipe_id)
             )
         """)
+        if DATABASE_URL:
+            for table_name in (
+                "favorites", "shopping_items", "fridge_items", "household_profiles",
+                "user_flags", "cooking_history", "recipe_ratings",
+            ):
+                conn.execute(f"ALTER TABLE {table_name} ALTER COLUMN user_id TYPE BIGINT")
+
         for recipe in recipes:
             conn.execute(
                 """
@@ -456,6 +549,9 @@ def set_onboarding_completed(user_id: int) -> None:
     set_user_flag(user_id, ONBOARDING_DONE_KEY, "1")
     delete_user_flag(user_id, ONBOARDING_FLOW_KEY)
     delete_user_flag(user_id, "awaiting_profile_name")
+    delete_user_flag(user_id, "awaiting_onboarding_preferences")
+    delete_user_flag(user_id, "awaiting_onboarding_restrictions")
+    delete_user_flag(user_id, "onboarding_profile_code")
 
 NOTIFICATION_DEFAULT_TIMES = {
     "breakfast": "09:00",
@@ -1649,99 +1745,104 @@ def family_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 
-def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int], used_product_counts: dict[str, int] | None = None) -> int:
-    """Оценка для меню недели: использует те же семейные ограничения, что и умный подбор."""
+def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int]) -> int:
+    """Единая оценка для меню недели: учитывает семью, ограничения, предпочтения, цели, холодильник и историю."""
     recipe_id = int(recipe.get("id", 0) or 0)
     score = 0
 
-    # Жёстко штрафуем запрещённые продукты. В норме такие рецепты отфильтровываются
-    # ещё до скоринга, но этот штраф защищает от крайних случаев.
-    if recipe_blocked_terms(recipe, user_id):
-        score -= 10000
-
     if recipe_id in used_ids:
         score -= 1000
+
+    active_profiles = family_active_profiles(user_id)
+    preference_terms: list[str] = []
+    restriction_terms: list[str] = []
+    goals: list[str] = []
+    if family_consider_enabled(user_id, "prefs"):
+        for profile in active_profiles:
+            preference_terms.extend(_split_profile_terms(profile.get("preferences")))
+    if family_consider_enabled(user_id, "limits"):
+        for profile in active_profiles:
+            restriction_terms.extend(_split_profile_terms(profile.get("restrictions")))
+    if family_consider_enabled(user_id, "goals"):
+        for profile in active_profiles:
+            goal = str(profile.get("goal") or "").strip().lower()
+            if goal:
+                goals.append(goal)
+
+    preference_terms = list(dict.fromkeys(preference_terms))
+    restriction_terms = list(dict.fromkeys(restriction_terms))
+
+    if restriction_terms and _matched_terms(recipe, restriction_terms):
+        return -100000
+
+    matched_prefs = _matched_terms(recipe, preference_terms)
+    if matched_prefs:
+        score += 25 + min(20, len(matched_prefs) * 5)
+
+    calories = int(recipe.get("calories", 0) or 0)
+    for goal in goals:
+        if "похуд" in goal:
+            if calories and calories <= 700:
+                score += 15
+            elif calories and calories >= 1000:
+                score -= 20
+        elif "набор" in goal or "мас" in goal:
+            if calories and calories >= 700:
+                score += 12
+        elif "поддерж" in goal:
+            score += 4
 
     selected = set(get_fridge_items(user_id))
     required = detected_product_codes(recipe)
     if required:
         matched = required & selected
         missing = required - selected
-        if not missing:
-            score += 8
-        elif len(missing) <= 2:
-            score += 4
-        score += min(len(matched), 3)
-
-    preference_terms = get_family_preference_terms(user_id)
-    matched_prefs = _matched_terms(recipe, preference_terms)
-    if matched_prefs:
-        score += min(20, 6 + len(matched_prefs) * 4)
-
-    goals = get_family_goals(user_id)
-    calories = int(recipe.get("calories", 0) or 0)
-    for goal in goals:
-        if "похуд" in goal:
-            if calories and calories <= 700:
-                score += 10
-            elif calories and calories >= 1000:
-                score -= 10
-        elif "набор" in goal or "мас" in goal:
-            if calories and calories >= 700:
-                score += 7
-        elif "поддерж" in goal:
-            score += 2
+        if selected:
+            if not missing:
+                score += 30
+            elif len(missing) <= 2:
+                score += 15 - len(missing) * 3
+            score += min(len(matched), 3)
 
     if recipe_id in set(get_favorites(user_id)):
-        score += 5
+        score += 15
 
     rating = get_user_recipe_rating(user_id, recipe_id)
     if rating:
-        score += rating * 2
+        score += rating * 4
+        if rating <= 2:
+            score -= 12
 
-    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=10):
-        score -= 8
+    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=14):
+        score -= 25
 
     time = int(recipe.get("time", 0) or 0)
     if time and time <= 30:
-        score += 2
-
-    # Разнообразие: если в меню уже много блюд с теми же продуктами, снижаем балл.
-    if used_product_counts:
-        for code in detected_product_codes(recipe):
-            score -= used_product_counts.get(code, 0) * 4
+        score += 4
 
     return score
 
-def pick_week_recipe(category: str, user_id: int, used_ids: set[int], used_product_counts: dict[str, int] | None = None) -> dict[str, Any] | None:
+def pick_week_recipe(category: str, user_id: int, used_ids: set[int]) -> dict[str, Any] | None:
     candidates = recipes_for_category(category)
     if not candidates:
         return None
-
-    # Сначала полностью исключаем блюда с ограничениями семьи.
-    allowed = [recipe for recipe in candidates if recipe_allowed_for_family(recipe, user_id)]
-    if not allowed:
-        # Если строгий фильтр убрал всё, лучше показать хоть что-то, чем пустой день,
-        # но это должен быть редкий случай при маленькой базе рецептов.
-        allowed = candidates
-
-    scored = [(score_recipe_for_week(r, user_id, used_ids, used_product_counts), random.random(), r) for r in allowed]
+    scored = [(score_recipe_for_week(r, user_id, used_ids), random.random(), r) for r in candidates]
+    allowed_scored = [item for item in scored if item[0] > -50000]
+    if allowed_scored:
+        scored = allowed_scored
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     recipe = scored[0][2]
     used_ids.add(int(recipe["id"]))
-    if used_product_counts is not None:
-        for code in detected_product_codes(recipe):
-            used_product_counts[code] = used_product_counts.get(code, 0) + 1
     return recipe
+
 
 def generate_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
     used_ids: set[int] = set()
-    used_product_counts: dict[str, int] = {}
     menu: dict[str, list[dict[str, Any]]] = {}
     for day in WEEK_DAYS:
         day_items: list[dict[str, Any]] = []
         for category in ["breakfast", "lunch", "dinner"]:
-            recipe = pick_week_recipe(category, user_id, used_ids, used_product_counts)
+            recipe = pick_week_recipe(category, user_id, used_ids)
             if recipe:
                 day_items.append(recipe)
         menu[day] = day_items
@@ -1809,20 +1910,10 @@ def replace_weekly_menu_item(user_id: int, day_index: int, slot_index: int) -> d
     candidates = [
         recipe for recipe in recipes_for_category(category)
         if int(recipe.get("id", 0) or 0) not in used_ids
-        and recipe_allowed_for_family(recipe, user_id)
     ]
 
     # Если все блюда этой категории уже встречаются в меню, разрешаем повторы,
     # но всё равно не возвращаем то же самое блюдо.
-    if not candidates:
-        candidates = [
-            recipe for recipe in recipes_for_category(category)
-            if int(recipe.get("id", 0) or 0) != current_id
-            and recipe_allowed_for_family(recipe, user_id)
-        ]
-
-    # Если ограничение слишком строгое и заменить нечем, разрешаем старый запасной вариант,
-    # но всё равно не возвращаем текущее блюдо.
     if not candidates:
         candidates = [
             recipe for recipe in recipes_for_category(category)
@@ -1832,14 +1923,8 @@ def replace_weekly_menu_item(user_id: int, day_index: int, slot_index: int) -> d
     if not candidates:
         return None
 
-    used_product_counts: dict[str, int] = {}
-    for day_items in menu.values():
-        for recipe in day_items:
-            for code in detected_product_codes(recipe):
-                used_product_counts[code] = used_product_counts.get(code, 0) + 1
-
     scored = [
-        (score_recipe_for_week(recipe, user_id, used_ids, used_product_counts), random.random(), recipe)
+        (score_recipe_for_week(recipe, user_id, used_ids), random.random(), recipe)
         for recipe in candidates
     ]
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -1857,7 +1942,7 @@ def format_weekly_menu(menu: dict[str, list[dict[str, Any]]]) -> str:
             "📅 <b>Меню недели</b>\n\n"
             "Пока меню не составлено. Нажми кнопку ниже, и я подберу блюда на неделю."
         )
-    lines = ["📅 <b>Меню недели</b>", "", "Собрано с учётом профилей, ограничений и разнообразия.", ""]
+    lines = ["📅 <b>Меню недели</b>", ""]
     for day in WEEK_DAYS:
         items = menu.get(day, [])
         if not items:
@@ -2048,6 +2133,33 @@ def add_weekly_menu_to_shopping(user_id: int) -> int:
     return added
 
 
+def _estimate_total_weight(recipe: dict[str, Any]) -> int:
+    """Грубая оценка веса готового блюда по ингредиентам."""
+    import re
+    total = 0.0
+    for item in recipe.get("ingredients", []):
+        text = str(item).lower().replace(",", ".")
+        match = re.search(r"(\d+(?:\.\d+)?)", text)
+        if not match:
+            continue
+        value = float(match.group(1))
+        if "кг" in text:
+            total += value * 1000
+        elif "мл" in text:
+            total += value
+        elif "л" in text and "ст. л" not in text and "ч. л" not in text:
+            total += value * 1000
+        elif "шт" in text:
+            total += value * 60
+        elif "ст. л" in text:
+            total += value * 15
+        elif "ч. л" in text:
+            total += value * 5
+        elif "г" in text:
+            total += value
+    return int(round(total)) if total > 0 else 0
+
+
 def format_portions(recipe: dict[str, Any], user_id: int) -> str:
     profiles = get_profiles(user_id)
     if not profiles:
@@ -2056,20 +2168,50 @@ def format_portions(recipe: dict[str, Any], user_id: int) -> str:
             "Профилей пока нет. Создайте профиль в разделе 👥 Профили, "
             "и потом бот сможет учитывать участников семьи."
         )
-    total_cal = int(recipe.get("calories", 0) or 0)
-    lines = [f"👥 <b>Порции: {recipe['name']}</b>", "", "Расчёт примерный: рецепт делится между профилями по долям.", ""]
-    factor = 1 / max(len(profiles), 1)
-    for p in profiles:
-        kcal = int(round(total_cal * factor)) if total_cal else 0
-        lines.append(f"👤 <b>{p['name']}</b> — примерно {int(round(factor * 100))}%")
-        if kcal:
-            lines.append(f"🔥 ~{kcal} ккал")
-        for item in recipe.get("ingredients", [])[:12]:
-            lines.append(f"• {scale_ingredient_text(item, factor)}")
-        lines.append("")
-    lines.append("🛒 В список покупок всё равно добавляются общие ингредиенты.")
-    return "\n".join(lines)
 
+    total_cal = int(recipe.get("calories", 0) or 0)
+    total_weight = _estimate_total_weight(recipe)
+
+    # Доли считаем по нормам калорий. Если нормы не заполнены — fallback на равные доли.
+    calories_by_profile: list[tuple[dict[str, Any], int]] = []
+    for p in profiles:
+        calories_by_profile.append((p, int(p.get("calories") or 0)))
+    total_profile_calories = sum(c for _, c in calories_by_profile)
+
+    lines = [f"👥 <b>Порции: {recipe['name']}</b>", ""]
+    if total_weight:
+        lines.append(f"🍽 Общий вес блюда: <b>~{total_weight} г</b>")
+    if total_cal:
+        protein = max(1, round(total_cal * 0.18 / 4))
+        fat = max(1, round(total_cal * 0.28 / 9))
+        carbs = max(1, round(total_cal * 0.54 / 4))
+        lines.append(f"🔥 КБЖУ всего блюда: <b>~{total_cal} ккал / Б {protein} / Ж {fat} / У {carbs}</b>")
+    else:
+        protein = fat = carbs = 0
+    lines.append("")
+
+    for p, profile_calories in calories_by_profile:
+        if total_profile_calories > 0 and profile_calories > 0:
+            factor = profile_calories / total_profile_calories
+        else:
+            factor = 1 / max(len(profiles), 1)
+        percent = int(round(factor * 100))
+        portion_weight = int(round(total_weight * factor)) if total_weight else 0
+        portion_cal = int(round(total_cal * factor)) if total_cal else 0
+        portion_protein = int(round(protein * factor)) if protein else 0
+        portion_fat = int(round(fat * factor)) if fat else 0
+        portion_carbs = int(round(carbs * factor)) if carbs else 0
+
+        lines.append(f"👤 <b>{p['name']}</b> — <b>{percent}%</b>")
+        if portion_weight:
+            lines.append(f"🍽 Порция: <b>~{portion_weight} г</b>")
+        if portion_cal:
+            lines.append(f"🔥 <b>~{portion_cal} ккал</b>")
+            lines.append(f"🥩 Б: {portion_protein} г / 🧈 Ж: {portion_fat} г / 🍚 У: {portion_carbs} г")
+        lines.append("")
+
+    lines.append("🛒 В список покупок добавляются общие ингредиенты всего блюда.")
+    return "\n".join(lines)
 
 def _has_word(text: str, words: list[str]) -> bool:
     text_low = text.lower()
@@ -2342,11 +2484,11 @@ def home_keyboard() -> InlineKeyboardMarkup:
 
 
 def _split_profile_terms(value: str | None) -> list[str]:
-    """Разбирает предпочтения/ограничения профиля: строки через запятую или JSON-список."""
+    """Разбирает предпочтения/ограничения и понимает обобщения: мясное, молочное и т.д."""
     if not value:
         return []
     text = str(value).strip()
-    items: list[str] = []
+    items: list[str]
     try:
         data = json.loads(text)
         if isinstance(data, list):
@@ -2354,115 +2496,33 @@ def _split_profile_terms(value: str | None) -> list[str]:
         else:
             items = [text]
     except Exception:
-        items = text.replace(";", ",").split(",")
+        items = text.replace(";", ",").replace("/", ",").split(",")
+
+    groups = {
+        "мясное": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс"],
+        "мясо": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс"],
+        "молочное": ["молоко", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир", "масло слив"],
+        "молочка": ["молоко", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир", "масло слив"],
+        "рыба": ["рыб", "лосос", "семг", "форел", "тунец", "кревет", "морепродукт"],
+        "рыбное": ["рыб", "лосос", "семг", "форел", "тунец", "кревет", "морепродукт"],
+        "морепродукты": ["кревет", "морепродукт", "рыб", "тунец"],
+        "мучное": ["мука", "хлеб", "лаваш", "макарон", "паста", "спагетти", "тесто"],
+        "глютен": ["мука", "хлеб", "лаваш", "макарон", "паста", "спагетти", "тесто"],
+        "сладкое": ["сахар", "мед", "мёд", "шоколад", "варенье"],
+        "грибы": ["гриб", "шампин"],
+    }
 
     result: list[str] = []
     for item in items:
-        term = str(item).strip().lower()
+        term = str(item).strip().lower().replace("ё", "е")
         if not term:
             continue
-        # Убираем совсем служебные слова, но не трогаем нормальные названия продуктов.
-        term = term.replace("ё", "е")
-        if term not in result:
-            result.append(term)
+        expanded = groups.get(term, [term])
+        for word in expanded:
+            word = word.strip().lower().replace("ё", "е")
+            if word and word not in result:
+                result.append(word)
     return result
-
-
-RESTRICTION_GROUPS = {
-    # Обобщения, которые пользователь может написать в профиле.
-    # Важно: это не названия кнопок, а слова/корни для поиска в тексте рецепта.
-    "мясное": [
-        "куриц", "индейк", "говядин", "говяж", "свинин", "свин",
-        "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс"
-    ],
-    "мясо": [
-        "куриц", "индейк", "говядин", "говяж", "свинин", "свин",
-        "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс"
-    ],
-    "птица": ["куриц", "индейк"],
-    "молочное": [
-        "молок", "сыр", "творог", "творож", "сметан", "сливк",
-        "йогурт", "кефир", "сливочное масло", "масло слив"
-    ],
-    "молочка": [
-        "молок", "сыр", "творог", "творож", "сметан", "сливк",
-        "йогурт", "кефир", "сливочное масло", "масло слив"
-    ],
-    "лактоза": ["молок", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир"],
-    "рыба": ["рыб", "тунец", "лосос", "семг", "форел", "кревет", "морепродукт"],
-    "морепродукты": ["рыб", "тунец", "лосос", "семг", "форел", "кревет", "морепродукт"],
-    "грибы": ["гриб", "шампин"],
-    "грибное": ["гриб", "шампин"],
-    "мучное": ["мука", "хлеб", "лаваш", "макарон", "паста", "спагетти", "лапша"],
-    "глютен": ["мука", "хлеб", "лаваш", "макарон", "паста", "спагетти", "лапша"],
-    "яйца": ["яйц", "омлет", "яичниц"],
-    "сладкое": ["сахар", "мед", "мед", "мёд", "шоколад", "варенье"],
-    "острое": ["остр", "чили", "перец чили"],
-}
-
-
-def _expand_restriction_terms(terms: list[str]) -> list[str]:
-    """Расширяет ограничения вроде 'мясное' до списка реальных продуктов.
-
-    Пользователь обычно пишет естественно: 'мясное', 'молочное', 'рыба'.
-    Алгоритм подбора должен сравнивать рецепт не с этим словом, а с продуктами
-    внутри группы: курица/фарш/сыр/молоко и т.д.
-    """
-    result: list[str] = []
-    for term in terms:
-        normalized = str(term).lower().replace("ё", "е").strip()
-        if not normalized:
-            continue
-        if normalized not in result:
-            result.append(normalized)
-
-        for group_name, aliases in RESTRICTION_GROUPS.items():
-            group_norm = group_name.replace("ё", "е")
-            # 'мясное', 'без мясного', 'мясо' и похожие формулировки.
-            if group_norm in normalized or normalized in group_norm:
-                for alias in aliases:
-                    alias_norm = alias.lower().replace("ё", "е").strip()
-                    if alias_norm and alias_norm not in result:
-                        result.append(alias_norm)
-    return result
-
-
-def get_family_restriction_terms(user_id: int) -> list[str]:
-    if not family_consider_enabled(user_id, "limits"):
-        return []
-    terms: list[str] = []
-    for profile in family_active_profiles(user_id):
-        terms.extend(_split_profile_terms(profile.get("restrictions")))
-    return _expand_restriction_terms(list(dict.fromkeys(terms)))
-
-
-def get_family_preference_terms(user_id: int) -> list[str]:
-    if not family_consider_enabled(user_id, "prefs"):
-        return []
-    terms: list[str] = []
-    for profile in family_active_profiles(user_id):
-        terms.extend(_split_profile_terms(profile.get("preferences")))
-    return list(dict.fromkeys(terms))
-
-
-def get_family_goals(user_id: int) -> list[str]:
-    if not family_consider_enabled(user_id, "goals"):
-        return []
-    goals: list[str] = []
-    for profile in family_active_profiles(user_id):
-        goal = str(profile.get("goal") or "").strip().lower()
-        if goal and goal not in goals:
-            goals.append(goal)
-    return goals
-
-
-def recipe_blocked_terms(recipe: dict[str, Any], user_id: int) -> list[str]:
-    return _matched_terms(recipe, get_family_restriction_terms(user_id))
-
-
-def recipe_allowed_for_family(recipe: dict[str, Any], user_id: int) -> bool:
-    return not recipe_blocked_terms(recipe, user_id)
-
 
 def _recipe_text_for_matching(recipe: dict[str, Any]) -> str:
     parts: list[str] = [
@@ -2526,7 +2586,7 @@ def recommend_recipe(user_id: int, exclude_recipe_id: int | None = None) -> tupl
 
     # Убираем дубли, сохраняя порядок.
     preference_terms = list(dict.fromkeys(preference_terms))
-    restriction_terms = _expand_restriction_terms(list(dict.fromkeys(restriction_terms)))
+    restriction_terms = list(dict.fromkeys(restriction_terms))
 
     allowed_candidates: list[dict[str, Any]] = []
     blocked_examples: list[str] = []
@@ -2720,6 +2780,32 @@ async def onboarding_add_profile_callback(callback: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Пока достаточно", callback_data="onboarding:notifications")],
         ]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:skip_preferences")
+async def onboarding_skip_preferences_callback(callback: CallbackQuery):
+    profile_code = get_user_flag(callback.from_user.id, "onboarding_profile_code")
+    profile = get_profile(callback.from_user.id, profile_code) if profile_code else None
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    set_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions", "1")
+    await callback.message.edit_text(
+        onboarding_restrictions_prompt_text(profile.get("name", "профиля") if profile else "профиля"),
+        reply_markup=onboarding_skip_profile_field_keyboard("restrictions"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:skip_restrictions")
+async def onboarding_skip_restrictions_callback(callback: CallbackQuery):
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
+    delete_user_flag(callback.from_user.id, "onboarding_profile_code")
+    await callback.message.edit_text(
+        onboarding_add_more_text(),
+        reply_markup=onboarding_add_more_keyboard(),
         parse_mode="HTML",
     )
     await callback.answer()
@@ -3701,9 +3787,11 @@ async def fallback(message: Message):
         code = add_profile_db(message.from_user.id, name)
         delete_user_flag(message.from_user.id, "awaiting_profile_name")
         if get_user_flag(message.from_user.id, ONBOARDING_FLOW_KEY) == "1":
+            set_user_flag(message.from_user.id, "onboarding_profile_code", code)
+            set_user_flag(message.from_user.id, "awaiting_onboarding_preferences", "1")
             await message.answer(
-                onboarding_add_more_text(),
-                reply_markup=onboarding_add_more_keyboard(),
+                onboarding_preferences_prompt_text(name),
+                reply_markup=onboarding_skip_profile_field_keyboard("preferences"),
                 parse_mode="HTML",
             )
             return
@@ -3711,6 +3799,35 @@ async def fallback(message: Message):
         await message.answer(
             profile_detail_text(profile),
             reply_markup=profile_detail_keyboard(code),
+            parse_mode="HTML",
+        )
+        return
+
+    if message.text and get_user_flag(message.from_user.id, "awaiting_onboarding_preferences") == "1":
+        profile_code = get_user_flag(message.from_user.id, "onboarding_profile_code")
+        if profile_code:
+            value = ", ".join(part.strip() for part in message.text.split(",") if part.strip())
+            update_profile_field_db(message.from_user.id, profile_code, "preferences", value)
+            profile = get_profile(message.from_user.id, profile_code)
+            delete_user_flag(message.from_user.id, "awaiting_onboarding_preferences")
+            set_user_flag(message.from_user.id, "awaiting_onboarding_restrictions", "1")
+            await message.answer(
+                onboarding_restrictions_prompt_text(profile.get("name", "профиля") if profile else "профиля"),
+                reply_markup=onboarding_skip_profile_field_keyboard("restrictions"),
+                parse_mode="HTML",
+            )
+            return
+
+    if message.text and get_user_flag(message.from_user.id, "awaiting_onboarding_restrictions") == "1":
+        profile_code = get_user_flag(message.from_user.id, "onboarding_profile_code")
+        if profile_code:
+            value = ", ".join(part.strip() for part in message.text.split(",") if part.strip())
+            update_profile_field_db(message.from_user.id, profile_code, "restrictions", value)
+        delete_user_flag(message.from_user.id, "awaiting_onboarding_restrictions")
+        delete_user_flag(message.from_user.id, "onboarding_profile_code")
+        await message.answer(
+            onboarding_add_more_text(),
+            reply_markup=onboarding_add_more_keyboard(),
             parse_mode="HTML",
         )
         return
