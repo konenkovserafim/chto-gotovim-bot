@@ -1800,18 +1800,13 @@ def family_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 
-def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int]) -> int:
-    """Единая оценка для меню недели: учитывает семью, ограничения, предпочтения, цели, холодильник и историю."""
-    recipe_id = int(recipe.get("id", 0) or 0)
-    score = 0
-
-    if recipe_id in used_ids:
-        score -= 1000
-
+def build_week_score_context(user_id: int) -> dict[str, Any]:
+    """Собирает данные для меню недели один раз, чтобы генерация не зависала на десятках запросов к БД."""
     active_profiles = family_active_profiles(user_id)
     preference_terms: list[str] = []
     restriction_terms: list[str] = []
     goals: list[str] = []
+
     if family_consider_enabled(user_id, "prefs"):
         for profile in active_profiles:
             preference_terms.extend(_split_profile_terms(profile.get("preferences")))
@@ -1824,8 +1819,32 @@ def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[in
             if goal:
                 goals.append(goal)
 
-    preference_terms = list(dict.fromkeys(preference_terms))
-    restriction_terms = list(dict.fromkeys(restriction_terms))
+    return {
+        "active_profiles": active_profiles,
+        "preference_terms": list(dict.fromkeys(preference_terms)),
+        "restriction_terms": list(dict.fromkeys(restriction_terms)),
+        "goals": list(dict.fromkeys(goals)),
+        "fridge_items": set(get_fridge_items(user_id)),
+        "favorites": set(get_favorites(user_id)),
+        "ratings": get_user_ratings(user_id),
+        "recent_ids": get_recent_cooked_recipe_ids(user_id, limit=14),
+    }
+
+
+def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int], context: dict[str, Any] | None = None) -> int:
+    """Единая оценка для меню недели: учитывает семью, ограничения, предпочтения, цели, холодильник и историю."""
+    if context is None:
+        context = build_week_score_context(user_id)
+
+    recipe_id = int(recipe.get("id", 0) or 0)
+    score = 0
+
+    if recipe_id in used_ids:
+        score -= 1000
+
+    preference_terms = context.get("preference_terms", [])
+    restriction_terms = context.get("restriction_terms", [])
+    goals = context.get("goals", [])
 
     if restriction_terms and _matched_terms(recipe, restriction_terms):
         return -100000
@@ -1847,7 +1866,7 @@ def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[in
         elif "поддерж" in goal:
             score += 4
 
-    selected = set(get_fridge_items(user_id))
+    selected = set(context.get("fridge_items", set()))
     required = detected_product_codes(recipe)
     if required:
         matched = required & selected
@@ -1859,16 +1878,16 @@ def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[in
                 score += 15 - len(missing) * 3
             score += min(len(matched), 3)
 
-    if recipe_id in set(get_favorites(user_id)):
+    if recipe_id in set(context.get("favorites", set())):
         score += 15
 
-    rating = get_user_recipe_rating(user_id, recipe_id)
+    rating = context.get("ratings", {}).get(recipe_id)
     if rating:
-        score += rating * 4
-        if rating <= 2:
+        score += int(rating) * 4
+        if int(rating) <= 2:
             score -= 12
 
-    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=14):
+    if recipe_id in set(context.get("recent_ids", set())):
         score -= 25
 
     time = int(recipe.get("time", 0) or 0)
@@ -1877,11 +1896,11 @@ def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[in
 
     return score
 
-def pick_week_recipe(category: str, user_id: int, used_ids: set[int]) -> dict[str, Any] | None:
+def pick_week_recipe(category: str, user_id: int, used_ids: set[int], context: dict[str, Any] | None = None) -> dict[str, Any] | None:
     candidates = recipes_for_category(category)
     if not candidates:
         return None
-    scored = [(score_recipe_for_week(r, user_id, used_ids), random.random(), r) for r in candidates]
+    scored = [(score_recipe_for_week(r, user_id, used_ids, context), random.random(), r) for r in candidates]
     allowed_scored = [item for item in scored if item[0] > -50000]
     if allowed_scored:
         scored = allowed_scored
@@ -1893,11 +1912,12 @@ def pick_week_recipe(category: str, user_id: int, used_ids: set[int]) -> dict[st
 
 def generate_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
     used_ids: set[int] = set()
+    context = build_week_score_context(user_id)
     menu: dict[str, list[dict[str, Any]]] = {}
     for day in WEEK_DAYS:
         day_items: list[dict[str, Any]] = []
         for category in ["breakfast", "lunch", "dinner"]:
-            recipe = pick_week_recipe(category, user_id, used_ids)
+            recipe = pick_week_recipe(category, user_id, used_ids, context)
             if recipe:
                 day_items.append(recipe)
         menu[day] = day_items
@@ -1978,8 +1998,9 @@ def replace_weekly_menu_item(user_id: int, day_index: int, slot_index: int) -> d
     if not candidates:
         return None
 
+    context = build_week_score_context(user_id)
     scored = [
-        (score_recipe_for_week(recipe, user_id, used_ids), random.random(), recipe)
+        (score_recipe_for_week(recipe, user_id, used_ids, context), random.random(), recipe)
         for recipe in candidates
     ]
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -2786,6 +2807,14 @@ def recommendation_keyboard(recipe: dict[str, Any]) -> InlineKeyboardMarkup:
 dp = Dispatcher()
 
 
+async def safe_callback_answer(callback: CallbackQuery, text: str | None = None, show_alert: bool = False) -> None:
+    """Безопасно отвечает на callback. Если Telegram уже считает кнопку устаревшей, не роняем обработчик."""
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except Exception:
+        logger.exception("Callback answer failed")
+
+
 async def send_home_screen(message: Message) -> None:
     await message.answer(
         format_home_text(),
@@ -3122,19 +3151,19 @@ async def settings_weekly_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "week:generate")
 async def week_generate_callback(callback: CallbackQuery):
+    await safe_callback_answer(callback, "Составляю меню...")
     menu = generate_weekly_menu(callback.from_user.id)
     await callback.message.edit_text(
         format_weekly_menu(menu),
         reply_markup=weekly_menu_keyboard(True),
         parse_mode="HTML",
     )
-    await callback.answer("Меню составлено")
 
 
 @dp.callback_query(F.data == "week:shopping")
 async def week_shopping_callback(callback: CallbackQuery):
+    await safe_callback_answer(callback, "Добавляю продукты...")
     added = add_weekly_menu_to_shopping(callback.from_user.id)
-    await callback.answer(f"Добавлено продуктов: {added} 🛒")
     await callback.message.answer(
         f"🛒 Добавлено в список покупок: <b>{added}</b>\n\n"
         "Одинаковые продукты объединены, где это безопасно.",
@@ -3144,9 +3173,10 @@ async def week_shopping_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "week:replace_menu")
 async def week_replace_menu_callback(callback: CallbackQuery):
+    await safe_callback_answer(callback)
     menu = get_saved_weekly_menu(callback.from_user.id)
     if not menu:
-        await callback.answer("Сначала составь меню недели", show_alert=True)
+        await safe_callback_answer(callback, "Сначала составь меню недели", show_alert=True)
         return
     await callback.message.edit_text(
         "🔄 <b>Заменить блюдо</b>\n\nВыбери конкретный приём пищи, который нужно заменить.",
@@ -3158,17 +3188,18 @@ async def week_replace_menu_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("week:replace:"))
 async def week_replace_item_callback(callback: CallbackQuery):
+    await safe_callback_answer(callback, "Заменяю блюдо...")
     try:
         _, _, day_raw, slot_raw = str(callback.data).split(":")
         day_index = int(day_raw)
         slot_index = int(slot_raw)
     except (ValueError, AttributeError):
-        await callback.answer("Не получилось заменить блюдо", show_alert=True)
+        await safe_callback_answer(callback, "Не получилось заменить блюдо", show_alert=True)
         return
 
     new_recipe = replace_weekly_menu_item(callback.from_user.id, day_index, slot_index)
     if not new_recipe:
-        await callback.answer("Не нашёл замену", show_alert=True)
+        await safe_callback_answer(callback, "Не нашёл замену", show_alert=True)
         return
 
     menu = get_saved_weekly_menu(callback.from_user.id)
@@ -3177,18 +3208,17 @@ async def week_replace_item_callback(callback: CallbackQuery):
         reply_markup=weekly_menu_keyboard(True),
         parse_mode="HTML",
     )
-    await callback.answer(f"Заменил на: {new_recipe['name']}")
 
 
 @dp.callback_query(F.data == "week:clear")
 async def week_clear_callback(callback: CallbackQuery):
+    await safe_callback_answer(callback, "Меню очищено")
     clear_weekly_menu(callback.from_user.id)
     await callback.message.edit_text(
         format_weekly_menu({}),
         reply_markup=weekly_menu_keyboard(False),
         parse_mode="HTML",
     )
-    await callback.answer("Меню очищено")
 
 
 @dp.callback_query(F.data == "history:clear")
