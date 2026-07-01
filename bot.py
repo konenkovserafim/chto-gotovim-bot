@@ -546,6 +546,32 @@ def onboarding_profile_prompt_text() -> str:
     )
 
 
+
+def onboarding_preferences_prompt_text(profile_name: str) -> str:
+    return (
+        f"❤️ <b>Предпочтения: {profile_name}</b>\n\n"
+        "Напишите, что любит этот человек.\n\n"
+        "Можно указать продукты, блюда или кухни через запятую.\n\n"
+        "Например: <b>курица, паста, сырники, итальянская кухня</b>."
+    )
+
+
+def onboarding_restrictions_prompt_text(profile_name: str) -> str:
+    return (
+        f"🚫 <b>Ограничения: {profile_name}</b>\n\n"
+        "Напишите, что исключить или не предлагать.\n\n"
+        "Можно указать продукты или общие категории через запятую.\n\n"
+        "Например: <b>свинина, грибы, морепродукты, мясное, молочное</b>."
+    )
+
+
+def onboarding_skip_profile_field_keyboard(field: str) -> InlineKeyboardMarkup:
+    callback = "onboarding:skip_preferences" if field == "preferences" else "onboarding:skip_restrictions"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустить", callback_data=callback)],
+    ])
+
+
 def onboarding_add_more_text() -> str:
     return (
         "✅ <b>Профиль создан.</b>\n\n"
@@ -1800,87 +1826,35 @@ def family_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 
-def _recipe_main_markers(recipe: dict[str, Any]) -> set[str]:
-    """Грубые маркеры основных продуктов для разнообразия меню недели."""
-    text = _recipe_text_for_matching(recipe)
-    marker_rules = {
-        "курица": ["куриц"],
-        "рыба": ["рыб", "лосос", "семг", "форел", "тунец"],
-        "яйца": ["яйц", "омлет", "яичниц"],
-        "рис": ["рис"],
-        "паста": ["макарон", "паста", "спагетти", "лапша"],
-        "картофель": ["картоф", "пюре"],
-        "творог": ["творог", "творож"],
-        "молочное": ["молоко", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир"],
-        "суп": ["суп", "борщ", "щи"],
-        "салат": ["салат"],
-        "крупы": ["греч", "пшено", "овсян", "булгур", "кускус"],
-    }
-    found: set[str] = set()
-    for marker, aliases in marker_rules.items():
-        if any(alias in text for alias in aliases):
-            found.add(marker)
-    return found
-
-
-def _recommendation_context(user_id: int) -> dict[str, Any]:
-    """Один раз собирает данные пользователя для подбора, меню недели и замены блюда."""
-    active_profiles, active_names = _active_family_summary(user_id)
-    consider_prefs = family_consider_enabled(user_id, "prefs")
-    consider_limits = family_consider_enabled(user_id, "limits")
-    consider_goals = family_consider_enabled(user_id, "goals")
-    consider_history = family_consider_enabled(user_id, "history")
-
-    preference_terms: list[str] = []
-    restriction_terms: list[str] = []
-    goals: list[str] = []
-    for profile in active_profiles:
-        if consider_prefs:
-            preference_terms.extend(_split_profile_terms(profile.get("preferences")))
-        if consider_limits:
-            restriction_terms.extend(_split_profile_terms(profile.get("restrictions")))
-        if consider_goals:
-            goal = str(profile.get("goal") or "").strip().lower()
-            if goal and goal not in goals:
-                goals.append(goal)
-
-    return {
-        "active_profiles": active_profiles,
-        "active_names": active_names,
-        "preference_terms": list(dict.fromkeys(preference_terms)),
-        "restriction_terms": list(dict.fromkeys(restriction_terms)),
-        "goals": goals,
-        "selected_fridge": set(get_fridge_items(user_id)),
-        "favorites": set(get_favorites(user_id)),
-        "ratings": get_user_ratings(user_id),
-        "recent": get_recent_cooked_recipe_ids(user_id, limit=14 if consider_history else 5),
-        "consider_history": consider_history,
-    }
-
-
-def recipe_allowed(recipe: dict[str, Any], context: dict[str, Any]) -> tuple[bool, list[str]]:
-    """Единый фильтр ограничений для подбора, меню недели и замены блюда."""
-    restriction_terms = context.get("restriction_terms", []) or []
-    matched = _matched_terms(recipe, restriction_terms)
-    return (len(matched) == 0), matched
-
-
-def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int], context: dict[str, Any] | None = None, used_markers: dict[str, int] | None = None) -> int:
+def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int]) -> int:
     """Единая оценка для меню недели: учитывает семью, ограничения, предпочтения, цели, холодильник и историю."""
     recipe_id = int(recipe.get("id", 0) or 0)
     score = 0
-    context = context or _recommendation_context(user_id)
-    used_markers = used_markers or {}
 
     if recipe_id in used_ids:
         score -= 1000
 
-    allowed, _blocked = recipe_allowed(recipe, context)
-    if not allowed:
-        return -100000
+    active_profiles = family_active_profiles(user_id)
+    preference_terms: list[str] = []
+    restriction_terms: list[str] = []
+    goals: list[str] = []
+    if family_consider_enabled(user_id, "prefs"):
+        for profile in active_profiles:
+            preference_terms.extend(_split_profile_terms(profile.get("preferences")))
+    if family_consider_enabled(user_id, "limits"):
+        for profile in active_profiles:
+            restriction_terms.extend(_split_profile_terms(profile.get("restrictions")))
+    if family_consider_enabled(user_id, "goals"):
+        for profile in active_profiles:
+            goal = str(profile.get("goal") or "").strip().lower()
+            if goal:
+                goals.append(goal)
 
-    preference_terms = context.get("preference_terms", []) or []
-    goals = context.get("goals", []) or []
+    preference_terms = list(dict.fromkeys(preference_terms))
+    restriction_terms = list(dict.fromkeys(restriction_terms))
+
+    if restriction_terms and _matched_terms(recipe, restriction_terms):
+        return -100000
 
     matched_prefs = _matched_terms(recipe, preference_terms)
     if matched_prefs:
@@ -1899,7 +1873,7 @@ def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[in
         elif "поддерж" in goal:
             score += 4
 
-    selected = context.get("selected_fridge", set()) or set()
+    selected = set(get_fridge_items(user_id))
     required = detected_product_codes(recipe)
     if required:
         matched = required & selected
@@ -1911,23 +1885,17 @@ def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[in
                 score += 15 - len(missing) * 3
             score += min(len(matched), 3)
 
-    if recipe_id in (context.get("favorites", set()) or set()):
+    if recipe_id in set(get_favorites(user_id)):
         score += 15
 
-    rating = (context.get("ratings", {}) or {}).get(recipe_id)
+    rating = get_user_recipe_rating(user_id, recipe_id)
     if rating:
         score += rating * 4
         if rating <= 2:
             score -= 12
 
-    if recipe_id in (context.get("recent", set()) or set()):
+    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=14):
         score -= 25
-
-    markers = _recipe_main_markers(recipe)
-    for marker in markers:
-        already_used = used_markers.get(marker, 0)
-        if already_used:
-            score -= min(35, 12 * already_used)
 
     time = int(recipe.get("time", 0) or 0)
     if time and time <= 30:
@@ -1935,33 +1903,27 @@ def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[in
 
     return score
 
-def pick_week_recipe(category: str, user_id: int, used_ids: set[int], context: dict[str, Any] | None = None, used_markers: dict[str, int] | None = None) -> dict[str, Any] | None:
+def pick_week_recipe(category: str, user_id: int, used_ids: set[int]) -> dict[str, Any] | None:
     candidates = recipes_for_category(category)
     if not candidates:
         return None
-    context = context or _recommendation_context(user_id)
-    used_markers = used_markers if used_markers is not None else {}
-    scored = [(score_recipe_for_week(r, user_id, used_ids, context, used_markers), random.random(), r) for r in candidates]
+    scored = [(score_recipe_for_week(r, user_id, used_ids), random.random(), r) for r in candidates]
     allowed_scored = [item for item in scored if item[0] > -50000]
     if allowed_scored:
         scored = allowed_scored
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     recipe = scored[0][2]
     used_ids.add(int(recipe["id"]))
-    for marker in _recipe_main_markers(recipe):
-        used_markers[marker] = used_markers.get(marker, 0) + 1
     return recipe
 
 
 def generate_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
     used_ids: set[int] = set()
-    used_markers: dict[str, int] = {}
-    context = _recommendation_context(user_id)
     menu: dict[str, list[dict[str, Any]]] = {}
     for day in WEEK_DAYS:
         day_items: list[dict[str, Any]] = []
         for category in ["breakfast", "lunch", "dinner"]:
-            recipe = pick_week_recipe(category, user_id, used_ids, context, used_markers)
+            recipe = pick_week_recipe(category, user_id, used_ids)
             if recipe:
                 day_items.append(recipe)
         menu[day] = day_items
@@ -1971,6 +1933,7 @@ def generate_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
         json.dumps({day: [int(r["id"]) for r in items] for day, items in menu.items()}, ensure_ascii=False),
     )
     return menu
+
 
 def get_saved_weekly_menu(user_id: int) -> dict[str, list[dict[str, Any]]]:
     raw = get_user_flag(user_id, "weekly_menu_ids")
@@ -2617,8 +2580,8 @@ def _split_profile_terms(value: str | None) -> list[str]:
         items = text.replace(";", ",").replace("/", ",").split(",")
 
     groups = {
-        "мясное": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс", "печен", "печень", "субпродукт"],
-        "мясо": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс", "печен", "печень", "субпродукт"],
+        "мясное": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс"],
+        "мясо": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс"],
         "молочное": ["молоко", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир", "масло слив"],
         "молочка": ["молоко", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир", "масло слив"],
         "рыба": ["рыб", "лосос", "семг", "форел", "тунец", "кревет", "морепродукт"],
@@ -2683,20 +2646,35 @@ def recommend_recipe(user_id: int, exclude_recipe_id: int | None = None) -> tupl
     ratings = get_user_ratings(user_id)
     candidates = recipes_for_category(target_category) or RECIPES
 
-    context = _recommendation_context(user_id)
-    active_profiles = context["active_profiles"]
-    active_names = context["active_names"]
-    preference_terms = context["preference_terms"]
-    restriction_terms = context["restriction_terms"]
-    goals = context["goals"]
-    consider_history = context["consider_history"]
+    active_profiles, active_names = _active_family_summary(user_id)
+    consider_prefs = family_consider_enabled(user_id, "prefs")
+    consider_limits = family_consider_enabled(user_id, "limits")
+    consider_goals = family_consider_enabled(user_id, "goals")
+    consider_history = family_consider_enabled(user_id, "history")
+
+    preference_terms: list[str] = []
+    restriction_terms: list[str] = []
+    goals: list[str] = []
+    for profile in active_profiles:
+        if consider_prefs:
+            preference_terms.extend(_split_profile_terms(profile.get("preferences")))
+        if consider_limits:
+            restriction_terms.extend(_split_profile_terms(profile.get("restrictions")))
+        if consider_goals:
+            goal = str(profile.get("goal") or "").strip().lower()
+            if goal and goal not in goals:
+                goals.append(goal)
+
+    # Убираем дубли, сохраняя порядок.
+    preference_terms = list(dict.fromkeys(preference_terms))
+    restriction_terms = list(dict.fromkeys(restriction_terms))
 
     allowed_candidates: list[dict[str, Any]] = []
     blocked_examples: list[str] = []
     if restriction_terms:
         for recipe in candidates:
-            allowed, blocked = recipe_allowed(recipe, context)
-            if not allowed:
+            blocked = _matched_terms(recipe, restriction_terms)
+            if blocked:
                 if len(blocked_examples) < 3:
                     blocked_examples.append(f"{recipe.get('name', 'блюдо')} ({', '.join(blocked[:2])})")
                 continue
@@ -3170,13 +3148,13 @@ async def settings_weekly_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "week:generate")
 async def week_generate_callback(callback: CallbackQuery):
-    await callback.answer("Составляю меню...")
     menu = generate_weekly_menu(callback.from_user.id)
     await callback.message.edit_text(
         format_weekly_menu(menu),
         reply_markup=weekly_menu_keyboard(True),
         parse_mode="HTML",
     )
+    await callback.answer("Меню составлено")
 
 
 @dp.callback_query(F.data == "week:shopping")
