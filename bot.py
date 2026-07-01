@@ -31,6 +31,7 @@ if not BOT_TOKEN:
 
 RECIPES_PATH = Path("recipes.json")
 DB_PATH = Path("bot_data.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 PAGE_SIZE = 8
 
 CATEGORY_TITLES = {
@@ -137,7 +138,94 @@ def load_recipes_from_json() -> list[dict[str, Any]]:
         return json.load(f)
 
 
-def db_connect() -> sqlite3.Connection:
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:
+    psycopg2 = None
+
+
+def _sqlite_to_pg_sql(sql: str) -> str:
+    """Минимальный перевод SQL из SQLite-стиля в PostgreSQL-стиль."""
+    text = sql
+    stripped = " ".join(text.strip().split()).lower()
+
+    text = text.replace("id INTEGER PRIMARY KEY AUTOINCREMENT", "id SERIAL PRIMARY KEY")
+    text = text.replace("user_id INTEGER NOT NULL", "user_id BIGINT NOT NULL")
+    text = text.replace("user_id INTEGER", "user_id BIGINT")
+    text = text.replace("REAL", "DOUBLE PRECISION")
+    text = text.replace(" COLLATE NOCASE", "")
+    text = text.replace("COLLATE NOCASE", "")
+
+    # SQLite UPSERT/IGNORE -> PostgreSQL ON CONFLICT.
+    if stripped.startswith("insert or ignore into favorites"):
+        text = text.replace("INSERT OR IGNORE INTO favorites", "INSERT INTO favorites")
+        text += " ON CONFLICT (user_id, recipe_id) DO NOTHING"
+    elif stripped.startswith("insert or ignore into shopping_items"):
+        text = text.replace("INSERT OR IGNORE INTO shopping_items", "INSERT INTO shopping_items")
+        text += " ON CONFLICT (user_id, item) DO NOTHING"
+    elif stripped.startswith("insert or ignore into fridge_items"):
+        text = text.replace("INSERT OR IGNORE INTO fridge_items", "INSERT INTO fridge_items")
+        text += " ON CONFLICT (user_id, product_code) DO NOTHING"
+    elif stripped.startswith("insert or replace into user_flags"):
+        text = text.replace("INSERT OR REPLACE INTO user_flags", "INSERT INTO user_flags")
+        text += " ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value"
+    elif stripped.startswith("insert or replace into recipe_ratings"):
+        text = text.replace("INSERT OR REPLACE INTO recipe_ratings", "INSERT INTO recipe_ratings")
+        text += " ON CONFLICT (user_id, recipe_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = EXCLUDED.rated_at"
+    elif stripped.startswith("insert or replace into recipes"):
+        text = text.replace("INSERT OR REPLACE INTO recipes", "INSERT INTO recipes")
+        text += " ON CONFLICT (id) DO UPDATE SET category = EXCLUDED.category, name = EXCLUDED.name, time = EXCLUDED.time, difficulty = EXCLUDED.difficulty, price = EXCLUDED.price, calories = EXCLUDED.calories, ingredients_json = EXCLUDED.ingredients_json, steps_json = EXCLUDED.steps_json, tags_json = EXCLUDED.tags_json"
+
+    text = text.replace("?", "%s")
+    return text
+
+
+class PostgresConnection:
+    def __init__(self, dsn: str):
+        if psycopg2 is None:
+            raise RuntimeError("DATABASE_URL is set, but psycopg2-binary is not installed. Add psycopg2-binary to requirements.txt.")
+        self.conn = psycopg2.connect(dsn, cursor_factory=psycopg2.extras.RealDictCursor)
+
+    def execute(self, sql: str, params: tuple | list = ()):  # совместимость с sqlite3.Connection.execute
+        normalized = " ".join(sql.strip().split()).lower()
+        if normalized.startswith("pragma table_info"):
+            table = sql.split("(", 1)[1].split(")", 1)[0].strip()
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT column_name AS name
+                FROM information_schema.columns
+                WHERE table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            return cur
+        cur = self.conn.cursor()
+        cur.execute(_sqlite_to_pg_sql(sql), tuple(params or ()))
+        return cur
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.conn.commit()
+        else:
+            self.conn.rollback()
+        self.conn.close()
+
+
+def db_connect():
+    if DATABASE_URL:
+        return PostgresConnection(DATABASE_URL)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -235,6 +323,13 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, recipe_id)
             )
         """)
+        if DATABASE_URL:
+            for table_name in (
+                "favorites", "shopping_items", "fridge_items", "household_profiles",
+                "user_flags", "cooking_history", "recipe_ratings",
+            ):
+                conn.execute(f"ALTER TABLE {table_name} ALTER COLUMN user_id TYPE BIGINT")
+
         for recipe in recipes:
             conn.execute(
                 """
@@ -373,20 +468,73 @@ ONBOARDING_FLOW_KEY = "onboarding_flow_v1"
 def onboarding_intro_text() -> str:
     return (
         "🍽 <b>Добро пожаловать в «Что готовим?»</b>\n\n"
-        "Я помогу вам:\n\n"
-        "🥘 подобрать блюда\n"
-        "🛒 составить список покупок\n"
-        "📅 сделать меню недели\n"
-        "👨‍👩‍👧 учитывать вкусы всей семьи\n\n"
-        "Начнём?"
+        "Я помогу вам быстро решить главный вопрос: <b>что сегодня приготовить</b>.\n\n"
+        "Внутри есть рецепты, умный подбор, меню недели, холодильник, список покупок, "
+        "профили семьи, история и уведомления.\n\n"
+        "Сначала покажу, где что находится."
     )
 
 
 def onboarding_intro_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Начать", callback_data="onboarding:start")],
+        [InlineKeyboardButton(text="🚀 Начать обучение", callback_data="onboarding:tour:1")],
         [InlineKeyboardButton(text="Пропустить", callback_data="onboarding:skip")],
     ])
+
+
+def onboarding_tour_text(page: int) -> str:
+    pages = {
+        1: (
+            "1/4 · <b>Главные разделы</b>\n\n"
+            "🏠 <b>Главная</b> — вернуться на стартовый экран.\n"
+            "🍳 <b>Завтрак</b>, 🍲 <b>Обед</b>, 🍽 <b>Ужин</b>, 🥗 <b>Перекус</b> — открыть рецепты по разделам.\n"
+            "📅 <b>Меню недели</b> — составить план питания на 7 дней.\n"
+            "🔍 <b>Поиск</b> — найти блюдо по названию, продукту или фильтрам."
+        ),
+        2: (
+            "2/4 · <b>Рецепты и подбор</b>\n\n"
+            "✨ <b>Подобрать блюдо</b> на главном экране помогает выбрать вариант под текущее время дня.\n\n"
+            "В карточке рецепта можно:\n"
+            "✅ отметить, что приготовили;\n"
+            "⭐ поставить оценку;\n"
+            "❤️ добавить в избранное;\n"
+            "🛒 отправить продукты в список покупок."
+        ),
+        3: (
+            "3/4 · <b>Покупки и холодильник</b>\n\n"
+            "🥶 <b>Холодильник</b> — отметьте продукты, которые есть дома. "
+            "Так бот точнее подберёт блюда.\n\n"
+            "🛒 <b>Список продуктов</b> — сюда попадают ингредиенты из рецептов и меню недели.\n\n"
+            "📅 В меню недели можно одной кнопкой добавить продукты сразу на несколько дней."
+        ),
+        4: (
+            "4/4 · <b>Семья и настройки</b>\n\n"
+            "👥 <b>Профили</b> — добавьте участников семьи, их цели, предпочтения и ограничения.\n"
+            "👨‍👩‍👧 <b>Семья</b> — выберите, для кого готовим.\n"
+            "🔔 <b>Уведомления</b> — напоминания о завтраке, обеде и ужине.\n"
+            "📖 <b>История</b> — блюда, которые вы уже готовили.\n\n"
+            "Теперь можно создать первый профиль."
+        ),
+    }
+    return pages.get(page, pages[1])
+
+
+def onboarding_tour_keyboard(page: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"onboarding:tour:{page - 1}"))
+    if page < 4:
+        nav.append(InlineKeyboardButton(text="Дальше ➡️", callback_data=f"onboarding:tour:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    if page < 4:
+        rows.append([InlineKeyboardButton(text="Пропустить обучение", callback_data="onboarding:profile")])
+    else:
+        rows.append([InlineKeyboardButton(text="👤 Создать первый профиль", callback_data="onboarding:profile")])
+        rows.append([InlineKeyboardButton(text="Пропустить профиль", callback_data="onboarding:notifications")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def onboarding_profile_prompt_text() -> str:
@@ -456,6 +604,9 @@ def set_onboarding_completed(user_id: int) -> None:
     set_user_flag(user_id, ONBOARDING_DONE_KEY, "1")
     delete_user_flag(user_id, ONBOARDING_FLOW_KEY)
     delete_user_flag(user_id, "awaiting_profile_name")
+    delete_user_flag(user_id, "awaiting_onboarding_preferences")
+    delete_user_flag(user_id, "awaiting_onboarding_restrictions")
+    delete_user_flag(user_id, "onboarding_profile_code")
 
 NOTIFICATION_DEFAULT_TIMES = {
     "breakfast": "09:00",
@@ -1650,46 +1801,90 @@ def family_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 def score_recipe_for_week(recipe: dict[str, Any], user_id: int, used_ids: set[int]) -> int:
-    """Простая оценка для меню недели: холодильник, избранное, оценки, история и разнообразие."""
+    """Единая оценка для меню недели: учитывает семью, ограничения, предпочтения, цели, холодильник и историю."""
     recipe_id = int(recipe.get("id", 0) or 0)
     score = 0
 
     if recipe_id in used_ids:
-        score -= 100
+        score -= 1000
+
+    active_profiles = family_active_profiles(user_id)
+    preference_terms: list[str] = []
+    restriction_terms: list[str] = []
+    goals: list[str] = []
+    if family_consider_enabled(user_id, "prefs"):
+        for profile in active_profiles:
+            preference_terms.extend(_split_profile_terms(profile.get("preferences")))
+    if family_consider_enabled(user_id, "limits"):
+        for profile in active_profiles:
+            restriction_terms.extend(_split_profile_terms(profile.get("restrictions")))
+    if family_consider_enabled(user_id, "goals"):
+        for profile in active_profiles:
+            goal = str(profile.get("goal") or "").strip().lower()
+            if goal:
+                goals.append(goal)
+
+    preference_terms = list(dict.fromkeys(preference_terms))
+    restriction_terms = list(dict.fromkeys(restriction_terms))
+
+    if restriction_terms and _matched_terms(recipe, restriction_terms):
+        return -100000
+
+    matched_prefs = _matched_terms(recipe, preference_terms)
+    if matched_prefs:
+        score += 25 + min(20, len(matched_prefs) * 5)
+
+    calories = int(recipe.get("calories", 0) or 0)
+    for goal in goals:
+        if "похуд" in goal:
+            if calories and calories <= 700:
+                score += 15
+            elif calories and calories >= 1000:
+                score -= 20
+        elif "набор" in goal or "мас" in goal:
+            if calories and calories >= 700:
+                score += 12
+        elif "поддерж" in goal:
+            score += 4
 
     selected = set(get_fridge_items(user_id))
     required = detected_product_codes(recipe)
     if required:
         matched = required & selected
         missing = required - selected
-        if not missing:
-            score += 8
-        elif len(missing) <= 2:
-            score += 4
-        score += min(len(matched), 3)
+        if selected:
+            if not missing:
+                score += 30
+            elif len(missing) <= 2:
+                score += 15 - len(missing) * 3
+            score += min(len(matched), 3)
 
     if recipe_id in set(get_favorites(user_id)):
-        score += 3
+        score += 15
 
     rating = get_user_recipe_rating(user_id, recipe_id)
     if rating:
-        score += rating
+        score += rating * 4
+        if rating <= 2:
+            score -= 12
 
-    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=10):
-        score -= 5
+    if recipe_id in get_recent_cooked_recipe_ids(user_id, limit=14):
+        score -= 25
 
     time = int(recipe.get("time", 0) or 0)
     if time and time <= 30:
-        score += 1
+        score += 4
 
     return score
-
 
 def pick_week_recipe(category: str, user_id: int, used_ids: set[int]) -> dict[str, Any] | None:
     candidates = recipes_for_category(category)
     if not candidates:
         return None
     scored = [(score_recipe_for_week(r, user_id, used_ids), random.random(), r) for r in candidates]
+    allowed_scored = [item for item in scored if item[0] > -50000]
+    if allowed_scored:
+        scored = allowed_scored
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     recipe = scored[0][2]
     used_ids.add(int(recipe["id"]))
@@ -1993,146 +2188,35 @@ def add_weekly_menu_to_shopping(user_id: int) -> int:
     return added
 
 
-
-def ingredient_weight_grams(name: str, amount: float, unit: str) -> float | None:
-    """Очень примерная оценка веса ингредиента для расчёта порций."""
-    name_low = normalize_text(name)
-    unit_low = normalize_text(unit)
-
-    if unit_low in {"г", "гр", "гр.", "грамм", "граммов"}:
-        return amount
-    if unit_low in {"кг", "килограмм", "килограммов"}:
-        return amount * 1000
-    if unit_low in {"мл", "мл."}:
-        return amount
-    if unit_low in {"л", "литр", "литра", "литров"}:
-        return amount * 1000
-    if "ст" in unit_low and "л" in unit_low:
-        return amount * 15
-    if "ч" in unit_low and "л" in unit_low:
-        return amount * 5
-    if "шт" in unit_low or "штук" in unit_low:
-        if "яйц" in name_low:
-            return amount * 50
-        if "лук" in name_low:
-            return amount * 80
-        if "помид" in name_low or "томат" in name_low:
-            return amount * 90
-        if "огур" in name_low:
-            return amount * 100
-        if "картоф" in name_low:
-            return amount * 140
-        if "морков" in name_low:
-            return amount * 80
-        if "банан" in name_low:
-            return amount * 120
-        if "яблок" in name_low:
-            return amount * 150
-        return amount * 100
-    return None
-
-
-def ingredient_macro_per_100(name: str) -> tuple[float, float, float, float] | None:
-    """Возвращает примерные КБЖУ на 100 г: ккал, белки, жиры, углеводы."""
-    n = normalize_text(name)
-    rules: list[tuple[list[str], tuple[float, float, float, float]]] = [
-        (["куриц", "филе", "грудк"], (120, 23, 2, 0)),
-        (["индейк"], (115, 22, 2, 0)),
-        (["говядин", "фарш"], (220, 18, 16, 0)),
-        (["свинин"], (260, 16, 22, 0)),
-        (["рыб", "тунец", "лосос", "семг", "форел"], (150, 20, 7, 0)),
-        (["яйц", "омлет", "яичниц"], (155, 13, 11, 1)),
-        (["сыр"], (350, 24, 28, 2)),
-        (["творог"], (140, 18, 5, 3)),
-        (["молоко", "кефир", "йогурт"], (60, 3, 3, 5)),
-        (["сметан", "сливк"], (200, 3, 20, 4)),
-        (["сливочное масло", "масло слив"], (750, 1, 82, 1)),
-        (["растительное масло", "масло"], (900, 0, 100, 0)),
-        (["рис"], (340, 7, 1, 75)),
-        (["греч"], (330, 13, 3, 68)),
-        (["макарон", "паста", "спагетти"], (350, 12, 2, 72)),
-        (["овсян", "хлопья"], (370, 13, 7, 60)),
-        (["мука"], (340, 10, 1, 70)),
-        (["хлеб", "лаваш"], (250, 8, 3, 50)),
-        (["картоф"], (80, 2, 0, 17)),
-        (["помид", "томат", "огур", "лук", "морков", "капуст", "перец", "кабач", "баклаж", "овощ", "зелень"], (35, 1, 0, 7)),
-        (["банан"], (90, 1, 0, 22)),
-        (["яблок"], (50, 0, 0, 12)),
-        (["сахар", "мед", "мёд"], (390, 0, 0, 98)),
-        (["фасол", "горох", "нут"], (300, 20, 2, 45)),
-    ]
-    for keys, macros in rules:
-        if any(key in n for key in keys):
-            return macros
-    return None
-
-
-def estimate_recipe_nutrition(recipe: dict[str, Any]) -> dict[str, int]:
-    """Примерно оценивает вес и КБЖУ всего блюда."""
-    total_weight = 0.0
-    protein = fat = carbs = calories_from_ingredients = 0.0
-
-    for ingredient in recipe.get("ingredients", []):
-        parsed = parse_ingredient_line(str(ingredient))
-        if not parsed:
+def _estimate_total_weight(recipe: dict[str, Any]) -> int:
+    """Грубая оценка веса готового блюда по ингредиентам."""
+    import re
+    total = 0.0
+    for item in recipe.get("ingredients", []):
+        text = str(item).lower().replace(",", ".")
+        match = re.search(r"(\d+(?:\.\d+)?)", text)
+        if not match:
             continue
-        name, amount, unit = parsed
-        grams = ingredient_weight_grams(name, amount, unit)
-        if not grams:
-            continue
-        total_weight += grams
-        macros = ingredient_macro_per_100(name)
-        if macros:
-            kcal100, p100, f100, c100 = macros
-            factor = grams / 100
-            calories_from_ingredients += kcal100 * factor
-            protein += p100 * factor
-            fat += f100 * factor
-            carbs += c100 * factor
-
-    recipe_calories = int(recipe.get("calories", 0) or 0)
-    total_calories = recipe_calories or int(round(calories_from_ingredients))
-
-    # Если КБЖУ удалось примерно посчитать, масштабируем их под калорийность рецепта из базы.
-    if total_calories and calories_from_ingredients > 0 and (protein or fat or carbs):
-        scale = total_calories / calories_from_ingredients
-        protein *= scale
-        fat *= scale
-        carbs *= scale
-    elif total_calories:
-        # Запасной вариант: среднее распределение калорий.
-        protein = total_calories * 0.20 / 4
-        fat = total_calories * 0.30 / 9
-        carbs = total_calories * 0.50 / 4
-
-    if not total_weight and total_calories:
-        # Очень грубая оценка, чтобы не показывать 0 г.
-        total_weight = total_calories * 1.2
-
-    return {
-        "weight": int(round(total_weight)) if total_weight else 0,
-        "calories": int(round(total_calories)) if total_calories else 0,
-        "protein": int(round(protein)) if protein else 0,
-        "fat": int(round(fat)) if fat else 0,
-        "carbs": int(round(carbs)) if carbs else 0,
-    }
-
-
-def active_profiles_for_portions(user_id: int) -> list[dict[str, Any]]:
-    profiles = family_active_profiles(user_id)
-    return profiles or get_profiles(user_id)
-
-
-def profile_calorie_weight(profile: dict[str, Any]) -> float:
-    calories = float(profile.get("calories") or 0)
-    if calories > 0:
-        return calories
-    factor = float(profile.get("portion_factor") or 1.0)
-    return max(factor, 0.1) * 2000
+        value = float(match.group(1))
+        if "кг" in text:
+            total += value * 1000
+        elif "мл" in text:
+            total += value
+        elif "л" in text and "ст. л" not in text and "ч. л" not in text:
+            total += value * 1000
+        elif "шт" in text:
+            total += value * 60
+        elif "ст. л" in text:
+            total += value * 15
+        elif "ч. л" in text:
+            total += value * 5
+        elif "г" in text:
+            total += value
+    return int(round(total)) if total > 0 else 0
 
 
 def format_portions(recipe: dict[str, Any], user_id: int) -> str:
-    profiles = active_profiles_for_portions(user_id)
+    profiles = get_profiles(user_id)
     if not profiles:
         return (
             "👥 <b>Порции</b>\n\n"
@@ -2140,51 +2224,49 @@ def format_portions(recipe: dict[str, Any], user_id: int) -> str:
             "и потом бот сможет учитывать участников семьи."
         )
 
-    nutrition = estimate_recipe_nutrition(recipe)
-    total_weight = nutrition["weight"]
-    total_cal = nutrition["calories"]
-    total_p = nutrition["protein"]
-    total_f = nutrition["fat"]
-    total_c = nutrition["carbs"]
+    total_cal = int(recipe.get("calories", 0) or 0)
+    total_weight = _estimate_total_weight(recipe)
 
-    weights = [profile_calorie_weight(profile) for profile in profiles]
-    total_profile_weight = sum(weights) or len(profiles)
+    # Доли считаем по нормам калорий. Если нормы не заполнены — fallback на равные доли.
+    calories_by_profile: list[tuple[dict[str, Any], int]] = []
+    for p in profiles:
+        calories_by_profile.append((p, int(p.get("calories") or 0)))
+    total_profile_calories = sum(c for _, c in calories_by_profile)
 
     lines = [f"👥 <b>Порции: {recipe['name']}</b>", ""]
     if total_weight:
         lines.append(f"🍽 Общий вес блюда: <b>~{total_weight} г</b>")
     if total_cal:
-        lines.append("<b>КБЖУ всего блюда:</b>")
-        lines.append(f"🔥 {total_cal} ккал")
-        lines.append(f"🥩 Б: {total_p} г  🧈 Ж: {total_f} г  🍚 У: {total_c} г")
+        protein = max(1, round(total_cal * 0.18 / 4))
+        fat = max(1, round(total_cal * 0.28 / 9))
+        carbs = max(1, round(total_cal * 0.54 / 4))
+        lines.append(f"🔥 КБЖУ всего блюда: <b>~{total_cal} ккал / Б {protein} / Ж {fat} / У {carbs}</b>")
+    else:
+        protein = fat = carbs = 0
     lines.append("")
 
-    for profile, weight in zip(profiles, weights):
-        share = weight / total_profile_weight if total_profile_weight else 1 / len(profiles)
-        percent = int(round(share * 100))
-        portion_weight = int(round(total_weight * share)) if total_weight else 0
-        portion_cal = int(round(total_cal * share)) if total_cal else 0
-        portion_p = int(round(total_p * share)) if total_p else 0
-        portion_f = int(round(total_f * share)) if total_f else 0
-        portion_c = int(round(total_c * share)) if total_c else 0
+    for p, profile_calories in calories_by_profile:
+        if total_profile_calories > 0 and profile_calories > 0:
+            factor = profile_calories / total_profile_calories
+        else:
+            factor = 1 / max(len(profiles), 1)
+        percent = int(round(factor * 100))
+        portion_weight = int(round(total_weight * factor)) if total_weight else 0
+        portion_cal = int(round(total_cal * factor)) if total_cal else 0
+        portion_protein = int(round(protein * factor)) if protein else 0
+        portion_fat = int(round(fat * factor)) if fat else 0
+        portion_carbs = int(round(carbs * factor)) if carbs else 0
 
-        goal = clean_profile_value(profile.get("goal"), "цель не указана")
-        calories_norm = int(profile.get("calories") or 0)
-
-        lines.append(f"👤 <b>{profile['name']}</b> — <b>{percent}%</b>")
-        if calories_norm:
-            lines.append(f"🎯 {goal}, норма: {calories_norm} ккал")
+        lines.append(f"👤 <b>{p['name']}</b> — <b>{percent}%</b>")
         if portion_weight:
             lines.append(f"🍽 Порция: <b>~{portion_weight} г</b>")
         if portion_cal:
-            lines.append(f"🔥 ~{portion_cal} ккал")
-            lines.append(f"🥩 Б: {portion_p} г  🧈 Ж: {portion_f} г  🍚 У: {portion_c} г")
+            lines.append(f"🔥 <b>~{portion_cal} ккал</b>")
+            lines.append(f"🥩 Б: {portion_protein} г / 🧈 Ж: {portion_fat} г / 🍚 У: {portion_carbs} г")
         lines.append("")
 
-    lines.append("Расчёт примерный: блюдо делится по долям от нормы калорий профилей.")
-    lines.append("🛒 В список покупок добавляются общие ингредиенты рецепта.")
+    lines.append("🛒 В список покупок добавляются общие ингредиенты всего блюда.")
     return "\n".join(lines)
-
 
 def _has_word(text: str, words: list[str]) -> bool:
     text_low = text.lower()
@@ -2457,11 +2539,11 @@ def home_keyboard() -> InlineKeyboardMarkup:
 
 
 def _split_profile_terms(value: str | None) -> list[str]:
-    """Разбирает предпочтения/ограничения профиля: строки через запятую или JSON-список."""
+    """Разбирает предпочтения/ограничения и понимает обобщения: мясное, молочное и т.д."""
     if not value:
         return []
     text = str(value).strip()
-    items: list[str] = []
+    items: list[str]
     try:
         data = json.loads(text)
         if isinstance(data, list):
@@ -2469,19 +2551,33 @@ def _split_profile_terms(value: str | None) -> list[str]:
         else:
             items = [text]
     except Exception:
-        items = text.replace(";", ",").split(",")
+        items = text.replace(";", ",").replace("/", ",").split(",")
+
+    groups = {
+        "мясное": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс"],
+        "мясо": ["куриц", "индейк", "говядин", "свинин", "фарш", "ветчин", "колбас", "сосиск", "бекон", "мяс"],
+        "молочное": ["молоко", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир", "масло слив"],
+        "молочка": ["молоко", "сыр", "творог", "сметан", "сливк", "йогурт", "кефир", "масло слив"],
+        "рыба": ["рыб", "лосос", "семг", "форел", "тунец", "кревет", "морепродукт"],
+        "рыбное": ["рыб", "лосос", "семг", "форел", "тунец", "кревет", "морепродукт"],
+        "морепродукты": ["кревет", "морепродукт", "рыб", "тунец"],
+        "мучное": ["мука", "хлеб", "лаваш", "макарон", "паста", "спагетти", "тесто"],
+        "глютен": ["мука", "хлеб", "лаваш", "макарон", "паста", "спагетти", "тесто"],
+        "сладкое": ["сахар", "мед", "мёд", "шоколад", "варенье"],
+        "грибы": ["гриб", "шампин"],
+    }
 
     result: list[str] = []
     for item in items:
-        term = str(item).strip().lower()
+        term = str(item).strip().lower().replace("ё", "е")
         if not term:
             continue
-        # Убираем совсем служебные слова, но не трогаем нормальные названия продуктов.
-        term = term.replace("ё", "е")
-        if term not in result:
-            result.append(term)
+        expanded = groups.get(term, [term])
+        for word in expanded:
+            word = word.strip().lower().replace("ё", "е")
+            if word and word not in result:
+                result.append(word)
     return result
-
 
 def _recipe_text_for_matching(recipe: dict[str, Any]) -> str:
     parts: list[str] = [
@@ -2708,18 +2804,41 @@ async def start(message: Message):
         )
         return
 
+    # Reply-клавиатуру нужно отправлять отдельным сообщением, потому что
+    # главный экран использует inline-кнопки. Отправляем её каждый раз на /start:
+    # так она восстановится даже после обновления, переустановки клиента или старых версий бота.
+    await message.answer("⌨️ Клавиатура включена", reply_markup=main_keyboard())
     await send_home_screen(message)
 
-    # Один раз отправляем Reply-клавиатуру, чтобы появилась кнопка «🏠 Главная».
-    # Дальше главный экран открывается без лишних сообщений.
-    if get_user_flag(message.from_user.id, "reply_keyboard_home_v1") != "1":
-        await message.answer("⌨️ Клавиатура обновлена", reply_markup=main_keyboard())
-        set_user_flag(message.from_user.id, "reply_keyboard_home_v1", "1")
 
+
+@dp.callback_query(F.data.startswith("onboarding:tour:"))
+async def onboarding_tour_callback(callback: CallbackQuery):
+    try:
+        page = int(callback.data.split(":")[-1])
+    except (ValueError, AttributeError):
+        page = 1
+    page = max(1, min(4, page))
+    await callback.message.edit_text(
+        onboarding_tour_text(page),
+        reply_markup=onboarding_tour_keyboard(page),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "onboarding:start")
 async def onboarding_start_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        onboarding_tour_text(1),
+        reply_markup=onboarding_tour_keyboard(1),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:profile")
+async def onboarding_profile_callback(callback: CallbackQuery):
     set_user_flag(callback.from_user.id, ONBOARDING_FLOW_KEY, "1")
     set_user_flag(callback.from_user.id, "awaiting_profile_name", "1")
     await callback.message.edit_text(
@@ -2741,6 +2860,32 @@ async def onboarding_add_profile_callback(callback: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Пока достаточно", callback_data="onboarding:notifications")],
         ]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:skip_preferences")
+async def onboarding_skip_preferences_callback(callback: CallbackQuery):
+    profile_code = get_user_flag(callback.from_user.id, "onboarding_profile_code")
+    profile = get_profile(callback.from_user.id, profile_code) if profile_code else None
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_preferences")
+    set_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions", "1")
+    await callback.message.edit_text(
+        onboarding_restrictions_prompt_text(profile.get("name", "профиля") if profile else "профиля"),
+        reply_markup=onboarding_skip_profile_field_keyboard("restrictions"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "onboarding:skip_restrictions")
+async def onboarding_skip_restrictions_callback(callback: CallbackQuery):
+    delete_user_flag(callback.from_user.id, "awaiting_onboarding_restrictions")
+    delete_user_flag(callback.from_user.id, "onboarding_profile_code")
+    await callback.message.edit_text(
+        onboarding_add_more_text(),
+        reply_markup=onboarding_add_more_keyboard(),
         parse_mode="HTML",
     )
     await callback.answer()
@@ -2815,6 +2960,8 @@ async def home_from_keyboard(message: Message):
 
 @dp.callback_query(F.data == "home:main")
 async def home_from_callback(callback: CallbackQuery):
+    # Inline-кнопка «Главная» заодно восстанавливает нижнюю Reply-клавиатуру.
+    await callback.message.answer("⌨️ Клавиатура включена", reply_markup=main_keyboard())
     await callback.message.answer(
         format_home_text(),
         reply_markup=home_keyboard(),
@@ -3722,9 +3869,11 @@ async def fallback(message: Message):
         code = add_profile_db(message.from_user.id, name)
         delete_user_flag(message.from_user.id, "awaiting_profile_name")
         if get_user_flag(message.from_user.id, ONBOARDING_FLOW_KEY) == "1":
+            set_user_flag(message.from_user.id, "onboarding_profile_code", code)
+            set_user_flag(message.from_user.id, "awaiting_onboarding_preferences", "1")
             await message.answer(
-                onboarding_add_more_text(),
-                reply_markup=onboarding_add_more_keyboard(),
+                onboarding_preferences_prompt_text(name),
+                reply_markup=onboarding_skip_profile_field_keyboard("preferences"),
                 parse_mode="HTML",
             )
             return
@@ -3732,6 +3881,35 @@ async def fallback(message: Message):
         await message.answer(
             profile_detail_text(profile),
             reply_markup=profile_detail_keyboard(code),
+            parse_mode="HTML",
+        )
+        return
+
+    if message.text and get_user_flag(message.from_user.id, "awaiting_onboarding_preferences") == "1":
+        profile_code = get_user_flag(message.from_user.id, "onboarding_profile_code")
+        if profile_code:
+            value = ", ".join(part.strip() for part in message.text.split(",") if part.strip())
+            update_profile_field_db(message.from_user.id, profile_code, "preferences", value)
+            profile = get_profile(message.from_user.id, profile_code)
+            delete_user_flag(message.from_user.id, "awaiting_onboarding_preferences")
+            set_user_flag(message.from_user.id, "awaiting_onboarding_restrictions", "1")
+            await message.answer(
+                onboarding_restrictions_prompt_text(profile.get("name", "профиля") if profile else "профиля"),
+                reply_markup=onboarding_skip_profile_field_keyboard("restrictions"),
+                parse_mode="HTML",
+            )
+            return
+
+    if message.text and get_user_flag(message.from_user.id, "awaiting_onboarding_restrictions") == "1":
+        profile_code = get_user_flag(message.from_user.id, "onboarding_profile_code")
+        if profile_code:
+            value = ", ".join(part.strip() for part in message.text.split(",") if part.strip())
+            update_profile_field_db(message.from_user.id, profile_code, "restrictions", value)
+        delete_user_flag(message.from_user.id, "awaiting_onboarding_restrictions")
+        delete_user_flag(message.from_user.id, "onboarding_profile_code")
+        await message.answer(
+            onboarding_add_more_text(),
+            reply_markup=onboarding_add_more_keyboard(),
             parse_mode="HTML",
         )
         return
